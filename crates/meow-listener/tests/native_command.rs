@@ -28,8 +28,29 @@ fn native_child_fixture() {
                 "ACL owner was not read: {output}"
             );
         }
+        #[cfg(windows)]
+        Ok("slow-powershell") => {
+            let output = meow_listener::tun::ownership::powershell(
+                "Start-Sleep -Seconds 21; 'native command completed'",
+            )
+            .unwrap();
+            assert_eq!(output, "native command completed");
+        }
         _ => {}
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn powershell_allows_slow_windows_native_command_completion() {
+    let output =
+        owned_command_output(&mut child("slow-powershell"), Duration::from_secs(65)).unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[cfg(windows)]

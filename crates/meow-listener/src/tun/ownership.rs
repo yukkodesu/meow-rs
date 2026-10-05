@@ -442,7 +442,8 @@ pub fn powershell(script: &str) -> io::Result<String> {
         "-NoProfile", "-NonInteractive", "-Command",
         &format!("[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $ErrorActionPreference='Stop'; {script}"),
     ]);
-    let output = owned_command_output(&mut command, std::time::Duration::from_secs(20))?;
+    // Read-only PowerShell snapshots exceeded 20 seconds on the Windows ARM64 CI runner.
+    let output = owned_command_output(&mut command, std::time::Duration::from_secs(60))?;
     if !output.status.success() {
         return Err(io::Error::other(
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
