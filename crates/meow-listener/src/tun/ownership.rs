@@ -433,10 +433,11 @@ pub fn powershell(script: &str) -> io::Result<String> {
     if size == 0 || size as usize >= buffer.len() {
         return Err(io::Error::last_os_error());
     }
-    let executable =
+    let powershell_home =
         PathBuf::from(String::from_utf16(&buffer[..size as usize]).map_err(io::Error::other)?)
-            .join("WindowsPowerShell/v1.0/powershell.exe");
-    let mut command = std::process::Command::new(executable);
+            .join("WindowsPowerShell/v1.0");
+    let mut command = std::process::Command::new(powershell_home.join("powershell.exe"));
+    command.env("PSModulePath", powershell_home.join("Modules"));
     command.args([
         "-NoProfile", "-NonInteractive", "-Command",
         &format!("[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $ErrorActionPreference='Stop'; {script}"),

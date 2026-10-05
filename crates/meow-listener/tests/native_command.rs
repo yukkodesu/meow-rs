@@ -10,8 +10,56 @@ fn native_child_fixture() {
             use std::io::Write;
             let _ = std::io::stdout().write_all(&vec![b'x'; 2 * 1024 * 1024]);
         }
+        #[cfg(windows)]
+        Ok("acl") => {
+            let output = meow_listener::tun::ownership::powershell(
+                r#"$acl = Get-Acl -LiteralPath $env:MEOW_NATIVE_ACL_PATH;
+                   foreach ($name in 'Get-Acl','Get-NetAdapter','Get-DnsClientServerAddress') {
+                       $command = Get-Command $name;
+                       if (!$command.Module.Path.StartsWith($PSHOME, [StringComparison]::OrdinalIgnoreCase)) {
+                           throw "Native command loaded outside the system PowerShell directory: $name"
+                       }
+                   }
+                   $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value"#,
+            )
+            .unwrap();
+            assert!(
+                output.starts_with("S-1-"),
+                "ACL owner was not read: {output}"
+            );
+        }
         _ => {}
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn acl_module_loads_with_a_parent_powershell_core_module_path() {
+    let directory = tempfile::tempdir().unwrap();
+    let module = directory.path().join("Microsoft.PowerShell.Security");
+    std::fs::create_dir(&module).unwrap();
+    std::fs::write(
+        module.join("Microsoft.PowerShell.Security.psd1"),
+        "@{ ModuleVersion='7.0.0'; RootModule='incompatible.psm1'; \
+         PowerShellVersion='3.0'; CompatiblePSEditions=@('Core'); \
+         FunctionsToExport=@('Get-Acl') }",
+    )
+    .unwrap();
+    std::fs::write(
+        module.join("incompatible.psm1"),
+        "throw 'Core module must not load in Windows PowerShell'",
+    )
+    .unwrap();
+    let mut command = child("acl");
+    command.env("PSModulePath", directory.path());
+    command.env("MEOW_NATIVE_ACL_PATH", directory.path());
+    let output = owned_command_output(&mut command, Duration::from_secs(30)).unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn child(mode: &str) -> Command {
