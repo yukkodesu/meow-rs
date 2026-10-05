@@ -3083,15 +3083,18 @@ fn load_mmdb(
     kind: &str,
     trigger: &str,
 ) -> Result<maxminddb::Reader<MmdbSource>, anyhow::Error> {
-    let source = if meow_common::managed_files::is_managed() {
-        // Caller-owned files can change concurrently; copying avoids mmap UB.
-        MmdbSource::Managed(meow_common::managed_files::read(path)?)
-    } else {
-        let file = meow_common::managed_files::open(path)?;
-        // CLI resources remain unchanged during this short-lived reader.
-        MmdbSource::Mapped(unsafe { maxminddb::Mmap::map(&file) }?)
-    };
-    let reader = maxminddb::Reader::from_source(source).map_err(|e| {
+    let reader = (|| -> anyhow::Result<_> {
+        let source = if meow_common::managed_files::is_managed() {
+            // Caller-owned files can change concurrently; copying avoids mmap UB.
+            MmdbSource::Managed(meow_common::managed_files::read(path)?)
+        } else {
+            let file = meow_common::managed_files::open(path)?;
+            // CLI resources remain unchanged during this short-lived reader.
+            MmdbSource::Mapped(unsafe { maxminddb::Mmap::map(&file) }?)
+        };
+        Ok(maxminddb::Reader::from_source(source)?)
+    })()
+    .map_err(|e| {
         anyhow::anyhow!(
             "Failed to load {} database at {}\n  required by rule: {}\n  underlying error: {}",
             kind,
