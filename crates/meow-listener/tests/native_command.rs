@@ -36,8 +36,42 @@ fn native_child_fixture() {
             .unwrap();
             assert_eq!(output, "native command completed");
         }
+        #[cfg(windows)]
+        Ok("dns-plan") => {
+            let fixture = include_str!("fixtures/windows_dns_commands.ps1");
+            let plan = include_str!("../src/tun/windows_dns_plan.ps1");
+            let output =
+                meow_listener::tun::ownership::powershell(&format!("{fixture}\n{plan}")).unwrap();
+            let mut resources: Vec<String> = serde_json::from_str(&output).unwrap();
+            resources.sort();
+            assert_eq!(
+                resources,
+                [
+                    "11111111-1111-1111-1111-111111111111|IPv4",
+                    "11111111-1111-1111-1111-111111111111|IPv6",
+                    "22222222-2222-2222-2222-222222222222|IPv6",
+                ]
+            );
+            let error = meow_listener::tun::ownership::powershell(&format!(
+                "{fixture}\n$script:queryFailure = $true\n{plan}"
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("DNS provider query failed"));
+        }
         _ => {}
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_dns_plan_handles_missing_family_records_but_reports_query_failures() {
+    let output = owned_command_output(&mut child("dns-plan"), Duration::from_secs(125)).unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[cfg(windows)]
