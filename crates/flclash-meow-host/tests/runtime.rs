@@ -216,7 +216,7 @@ async fn endpoints_configuration_logs_and_traffic() {
     assert!(stopped["externalController"].is_null());
     assert!(TcpStream::connect(proxy).await.is_err());
     assert!(TcpStream::connect(controller).await.is_err());
-    host.shutdown().await;
+    host.shutdown().await.unwrap();
 }
 
 async fn geodata_download_is_owned_and_uses_product_home() {
@@ -273,7 +273,7 @@ async fn geodata_download_is_owned_and_uses_product_home() {
         b"geodata!"
     );
     call(&host, "stopListener", Value::Null).await;
-    host.shutdown().await;
+    host.shutdown().await.unwrap();
     server_task.await.unwrap();
 }
 
@@ -324,5 +324,5 @@ async fn stopping_cancels_pending_provider_preparation() {
     );
     assert!(!home.path().join("providers/pending.yaml").exists());
     server_task.await.unwrap();
-    host.shutdown().await;
+    host.shutdown().await.unwrap();
 }

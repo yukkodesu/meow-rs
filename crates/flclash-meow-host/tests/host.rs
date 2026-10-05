@@ -33,6 +33,11 @@ async fn initialization_is_idle_and_unknown_nested_options_are_reported() {
     let state = call(&host, "getRuntimeState", Value::Null).await;
     assert_eq!(state["configured"], false);
     assert_eq!(state["running"], false);
+    assert!(matches!(
+        state["recovery"]["state"].as_str(),
+        Some("clean" | "recovered" | "needsPrivilege" | "failed")
+    ));
+    assert!(state["recovery"]["details"].is_array());
     let check = call(&host, "checkConfig", json!("proxies:\n  - name: edge\n    type: vless\n    server: localhost\n    port: 443\n    uuid: 00000000-0000-0000-0000-000000000000\n    reality-opts:\n      public-key: x\n      imaginary: true\n")).await;
     assert_eq!(check["valid"], false);
     assert!(check["diagnostics"]
@@ -94,7 +99,7 @@ async fn initialization_is_idle_and_unknown_nested_options_are_reported() {
         .as_str()
         .unwrap()
         .is_empty());
-    host.shutdown().await;
+    host.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -196,7 +201,7 @@ async fn proxy_ready_transfers_data_and_failed_replacement_restores_the_previous
     assert_eq!(call(&host, "stopListener", Value::Null).await, true);
     assert!(TcpStream::connect(proxy_address).await.is_err());
     assert_eq!(call(&host, "getIsInit", Value::Null).await, true);
-    host.shutdown().await;
+    host.shutdown().await.unwrap();
     origin_task.abort();
 }
 
@@ -236,7 +241,7 @@ async fn provider_nodes_with_unknown_options_cannot_silently_enter_a_group() {
         call(&host, "getRuntimeState", Value::Null).await["configured"],
         false
     );
-    host.shutdown().await;
+    host.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -341,6 +346,6 @@ async fn provider_members_can_be_selected_probed_and_refreshed_without_losing_va
         call(&host, "getProxies", Value::Null).await["proxies"]["route"]["all"],
         json!(["third"])
     );
-    host.shutdown().await;
+    host.shutdown().await.unwrap();
     task.abort();
 }

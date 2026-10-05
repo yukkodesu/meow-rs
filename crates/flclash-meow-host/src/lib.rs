@@ -1,5 +1,7 @@
 mod config;
 mod ipc;
+#[cfg(test)]
+mod lifecycle_tests;
 pub mod native;
 mod operations;
 pub mod protocol;
@@ -27,6 +29,8 @@ struct State {
     staged: Option<Runtime>,
     retired: Option<Runtime>,
     cleanup_failure: Option<String>,
+    recovery: meow_listener::tun::RecoveryStatus,
+    recovery_task: Option<tokio::task::JoinHandle<meow_listener::tun::RecoveryStatus>>,
     document: Option<Value>,
     closed: bool,
     generation: u64,
@@ -34,6 +38,8 @@ struct State {
 }
 
 pub struct Host {
+    #[cfg(unix)]
+    peer_identity: Option<(u32, u32)>,
     state: Mutex<State>,
     wanted: AtomicBool,
     generation: watch::Sender<u64>,
@@ -77,6 +83,8 @@ impl Host {
             }
         });
         Self {
+            #[cfg(unix)]
+            peer_identity: None,
             state: Mutex::new(State::default()),
             wanted: AtomicBool::new(false),
             generation,
@@ -91,6 +99,13 @@ impl Host {
 
     pub fn log_sender(&self) -> broadcast::Sender<LogMessage> {
         self.log_tx.clone()
+    }
+
+    #[cfg(unix)]
+    pub fn with_peer_identity(uid: u32, gid: u32) -> Self {
+        let mut host = Self::new();
+        host.peer_identity = Some((uid, gid));
+        host
     }
     pub fn subscribe_events(&self) -> broadcast::Receiver<Value> {
         self.events.subscribe()
@@ -148,6 +163,12 @@ impl Host {
         if state.closed {
             return Err(RpcError::new("closed", "The host session has closed"));
         }
+        if matches!(
+            method,
+            "initClash" | "setupConfig" | "updateConfig" | "startListener"
+        ) {
+            Self::complete_recovery(&mut state).await;
+        }
         if matches!(method, "setupConfig" | "updateConfig" | "startListener") {
             if let Some(failure) = state.cleanup_failure.as_ref() {
                 return Err(RpcError::new("resources_release_unconfirmed", failure));
@@ -167,6 +188,8 @@ impl Host {
                     .as_object_mut()
                     .expect("runtime state object")
                     .extend(endpoints.as_object().expect("endpoint object").clone());
+                result["recovery"] = serde_json::to_value(&state.recovery)
+                    .map_err(|error| RpcError::new("invalid_response", error.to_string()))?;
                 Ok(result)
             }
             "getIsInit" => Ok(json!(state.home.is_some())),
@@ -176,21 +199,26 @@ impl Host {
                 if !path.is_absolute() {
                     return Err(RpcError::new("invalid_path", "home-dir must be absolute"));
                 }
-                tokio::fs::create_dir_all(&path)
-                    .await
-                    .map_err(|e| RpcError::new("initialization_failed", e.to_string()))?;
-                let path = path
-                    .canonicalize()
-                    .map_err(|e| RpcError::new("initialization_failed", e.to_string()))?;
-                if state.home.as_ref().is_some_and(|old| *old != path) {
-                    return Err(RpcError::new(
-                        "already_initialized",
-                        "A session cannot switch home directories",
-                    ));
-                }
+                let path = if let Some(old) = state.home.as_ref() {
+                    match path.canonicalize() {
+                        Ok(path) if path == *old => path,
+                        _ => {
+                            return Err(RpcError::new(
+                                "already_initialized",
+                                "A session cannot switch home directories",
+                            ))
+                        }
+                    }
+                } else {
+                    self.initialize_home(path).await?
+                };
                 meow_config::set_external_plugins_allowed(false);
                 meow_common::set_home_dir(path.clone());
                 state.home = Some(path);
+                state.recovery_task = Some(tokio::task::spawn_blocking(
+                    crate::native::recover_existing_product_resources,
+                ));
+                Self::complete_recovery(&mut state).await;
                 Ok(json!(true))
             }
             "setupConfig" => {
@@ -201,7 +229,7 @@ impl Host {
                     )
                 })?;
                 let path = config::contained_path(home, "config.yaml")?;
-                let content = tokio::fs::read_to_string(&path)
+                let content = meow_common::managed_files::read_to_string_async(&path)
                     .await
                     .map_err(|e| RpcError::new("config_read_failed", e.to_string()))?;
                 self.apply(&mut state, &content, &arguments).await?;
@@ -240,26 +268,36 @@ impl Host {
                 Ok(json!(""))
             }
             "startListener" => {
-                let runtime = state.runtime.as_mut().ok_or_else(|| {
-                    RpcError::new(
+                if state.runtime.is_none() {
+                    return Err(RpcError::new(
                         "not_configured",
                         "Select and apply a valid profile before starting the proxy",
-                    )
-                })?;
+                    ));
+                }
+                state.cleanup_failure = Some("Startup cleanup is pending".into());
+                let runtime = state.runtime.as_mut().expect("configured runtime");
                 if self.wanted.load(Ordering::Acquire) {
-                    runtime.start().await?;
+                    if let Err(error) = runtime.start().await {
+                        if error.code == "resources_release_unconfirmed" {
+                            state.cleanup_failure = Some(error.message.clone());
+                        } else {
+                            state.cleanup_failure = None;
+                        }
+                        return Err(error);
+                    }
                 }
                 if !self.wanted.load(Ordering::Acquire) {
-                    runtime.stop().await;
+                    Self::stop_owned(&mut state).await?;
                     return Err(RpcError::new(
                         "request_superseded",
                         "A later stop superseded startup",
                     ));
                 }
-                Ok(json!(runtime.running()))
+                state.cleanup_failure = None;
+                Ok(json!(state.runtime.as_ref().is_some_and(Runtime::running)))
             }
             "stopListener" => {
-                Self::stop_owned(&mut state).await;
+                Self::stop_owned(&mut state).await?;
                 Ok(json!(true))
             }
             "getTraffic" | "getTotalTraffic" => {
@@ -308,14 +346,14 @@ impl Host {
                     .as_ref()
                     .ok_or_else(|| RpcError::new("not_initialized", "Host is not initialized"))?;
                 let path = config::contained_path(home, &format!("profiles/{id}.yaml"))?;
-                let text = tokio::fs::read_to_string(path)
+                let text = meow_common::managed_files::read_to_string_async(&path)
                     .await
                     .map_err(|e| RpcError::new("config_read_failed", e.to_string()))?;
                 serde_yaml::from_str(&text)
                     .map_err(|e| RpcError::new("invalid_config", e.to_string()))
             }
             "shutdown" => {
-                self.shutdown_locked(&mut state).await;
+                self.shutdown_locked(&mut state).await?;
                 Ok(json!(true))
             }
             _ => Err(RpcError::new(
@@ -397,8 +435,7 @@ impl Host {
             config=Box::pin(meow_config::build_config(raw,Some(home)))=>config.map_err(|e|RpcError::new("invalid_config",e.to_string()))?,
             _=generation.changed()=>return Err(RpcError::new("request_superseded","A later runtime intent superseded configuration preparation")),
         };
-        let mut candidate =
-            Runtime::prepare(config, self.log_tx.clone(), Some(binding), home.clone());
+        let candidate = Runtime::prepare(config, self.log_tx.clone(), Some(binding), home.clone());
         if let Some(selections) = selections.get("selected-map").and_then(Value::as_object) {
             for (group, node) in selections {
                 if let (Some(proxy), Some(node)) =
@@ -426,15 +463,30 @@ impl Host {
             .unwrap_or_else(|| "info".into());
         meow_api::log_stream::reload_log_level(&level)
             .map_err(|error| RpcError::new("log_configuration_failed", error))?;
+        let document = serde_yaml::from_str(content)
+            .map_err(|e| RpcError::new("invalid_config", e.to_string()))?;
         state.staged = Some(candidate);
+        state.cleanup_failure = Some("Runtime transition cleanup is pending".into());
         if let Some(old) = state.runtime.as_mut() {
-            old.stop().await;
+            if let Err(error) = old.stop().await {
+                state.cleanup_failure = Some(error.message.clone());
+                return Err(error);
+            }
         }
         state.retired = state.runtime.take();
         state.runtime = state.staged.take();
         if self.wanted.load(Ordering::Acquire) {
-            if let Err(error) = state.runtime.as_mut().expect("staged runtime").start().await {
-                state.runtime.as_mut().expect("staged runtime").stop().await;
+            if let Err(error) = state
+                .runtime
+                .as_mut()
+                .expect("staged runtime")
+                .start()
+                .await
+            {
+                if let Err(cleanup) = state.runtime.as_mut().expect("staged runtime").stop().await {
+                    state.cleanup_failure = Some(cleanup.message.clone());
+                    return Err(cleanup);
+                }
                 if let Err(error) = meow_api::log_stream::reload_log_level(&previous_level) {
                     tracing::error!("Previous log filter could not be restored: {error}");
                 }
@@ -448,19 +500,20 @@ impl Host {
                 } else {
                     Ok(false)
                 };
+                state.cleanup_failure = rollback.as_ref().err().and_then(|error| {
+                    (error.code == "resources_release_unconfirmed").then(|| error.message.clone())
+                });
                 let mut error = RpcError::new("config_apply_failed", error.message);
                 error.details = json!({"restored":matches!(rollback,Ok(true)),"rollbackError":rollback.err().map(|e|e.message)});
                 return Err(error);
             }
         }
         if !self.wanted.load(Ordering::Acquire) {
-            Self::stop_owned(state).await;
+            Self::stop_owned(state).await?;
         }
         state.retired = None;
-        state.document = Some(
-            serde_yaml::from_str(content)
-                .map_err(|e| RpcError::new("invalid_config", e.to_string()))?,
-        );
+        state.cleanup_failure = None;
+        state.document = Some(document);
         state.generation += 1;
         state.traffic_baseline = (0, 0);
         self.generation.send_modify(|g| *g += 1);
@@ -479,24 +532,78 @@ impl Host {
             self.emit_bulk("log", &log_value(log));
         }
     }
-    async fn shutdown_locked(&self, state: &mut State) {
+    async fn shutdown_locked(&self, state: &mut State) -> Result<(), RpcError> {
         self.wanted.store(false, Ordering::Release);
         self.generation.send_modify(|g| *g += 1);
-        Self::stop_owned(state).await;
+        Self::stop_owned(state).await?;
         state.runtime = None;
         state.staged = None;
         state.retired = None;
         state.closed = true;
+        Ok(())
     }
 
-    async fn stop_owned(state: &mut State) {
-        for runtime in [&mut state.runtime, &mut state.staged, &mut state.retired].into_iter().flatten() {
-            runtime.stop().await;
+    async fn initialize_home(&self, path: PathBuf) -> Result<PathBuf, RpcError> {
+        #[cfg(unix)]
+        if let Some((uid, gid)) = self.peer_identity {
+            return tokio::task::spawn_blocking(move || {
+                meow_common::managed_files::authorize_home(&path, uid, gid)
+            })
+            .await
+            .map_err(|error| RpcError::new("initialization_failed", error.to_string()))?
+            .map_err(|error| RpcError::new("invalid_home_owner", error.to_string()));
+        }
+        tokio::fs::create_dir_all(&path)
+            .await
+            .map_err(|error| RpcError::new("initialization_failed", error.to_string()))?;
+        path.canonicalize()
+            .map_err(|error| RpcError::new("initialization_failed", error.to_string()))
+    }
+
+    async fn stop_owned(state: &mut State) -> Result<(), RpcError> {
+        state.cleanup_failure = Some("Runtime cleanup is pending".into());
+        Self::complete_recovery(state).await;
+        let mut errors = Vec::new();
+        for runtime in [&mut state.runtime, &mut state.staged, &mut state.retired]
+            .into_iter()
+            .flatten()
+        {
+            if let Err(error) = runtime.stop().await {
+                errors.push(error.message);
+            }
+        }
+        if !errors.is_empty() {
+            let message = errors.join("; ");
+            state.cleanup_failure = Some(message.clone());
+            return Err(RpcError {
+                code: "resources_release_unconfirmed".into(),
+                message,
+                details: json!({"cleanupErrors":errors}),
+            });
+        }
+        state.staged = None;
+        state.retired = None;
+        state.cleanup_failure = None;
+        Ok(())
+    }
+
+    async fn complete_recovery(state: &mut State) {
+        if let Some(task) = state.recovery_task.as_mut() {
+            state.recovery = match task.await {
+                Ok(status) => status,
+                Err(error) => meow_listener::tun::RecoveryStatus {
+                    state: meow_listener::tun::RecoveryState::Failed,
+                    details: vec![format!("Recovery worker did not complete: {error}")],
+                },
+            };
+            state.recovery_task = None;
         }
     }
-    pub async fn shutdown(&self) {
+    pub async fn shutdown(&self) -> Result<(), RpcError> {
+        self.wanted.store(false, Ordering::Release);
+        self.generation.send_modify(|g| *g += 1);
         let mut state = self.state.lock().await;
-        self.shutdown_locked(&mut state).await;
+        self.shutdown_locked(&mut state).await
     }
 }
 

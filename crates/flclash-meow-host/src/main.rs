@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
             .map_err(|e| e.to_string())
     });
     let result = serve_until(Arc::clone(&host), stream, shutdown_signal()).await;
-    host.shutdown().await;
+    host.shutdown().await?;
     result?;
     Ok(())
 }

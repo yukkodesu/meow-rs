@@ -12,6 +12,14 @@ impl Host {
         if state.closed {
             return Err(RpcError::new("closed", "The host session has closed"));
         }
+        if matches!(
+            method,
+            "changeProxy" | "unfixProxy" | "asyncTestDelay" | "updateExternalProvider"
+        ) {
+            if let Some(failure) = state.cleanup_failure.as_ref() {
+                return Err(RpcError::new("resources_release_unconfirmed", failure));
+            }
+        }
         let runtime = state
             .runtime
             .as_ref()

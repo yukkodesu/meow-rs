@@ -97,7 +97,7 @@ where
     if !writer_task.is_finished() {
         let _ = writer_task.await;
     }
-    host.shutdown().await;
+    host.shutdown().await.map_err(io::Error::other)?;
     outcome
 }
 
