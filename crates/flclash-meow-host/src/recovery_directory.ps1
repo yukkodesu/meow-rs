@@ -35,9 +35,17 @@ foreach ($directory in @($product, $recovery)) {
             $rule = New-Object Security.AccessControl.FileSystemAccessRule($identity, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')
             $acl.AddAccessRule($rule)
         }
+        $users = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')
+        $rule = New-Object Security.AccessControl.FileSystemAccessRule($users, 'ReadAndExecute', 'ContainerInherit', 'None', 'Allow')
+        $acl.AddAccessRule($rule)
         $null = [IO.Directory]::CreateDirectory($directory, $acl)
     }
     Assert-TrustedItem (Get-Item -LiteralPath $directory -Force)
+    $acl = Get-Acl -LiteralPath $directory
+    $users = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')
+    $rule = New-Object Security.AccessControl.FileSystemAccessRule($users, 'ReadAndExecute', 'ContainerInherit', 'None', 'Allow')
+    $acl.AddAccessRule($rule)
+    Set-Acl -LiteralPath $directory -AclObject $acl
 }
 
 foreach ($name in @('dns.json', 'routes.json', 'dns.pending', 'routes.pending', 'resources.lock')) {

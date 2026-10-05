@@ -353,7 +353,7 @@ pub(super) fn create_privileged_journal(path: &Path) -> io::Result<fs::File> {
                 CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
             },
         };
-        let descriptor: Vec<u16> = "O:BAG:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)"
+        let descriptor: Vec<u16> = "O:BAG:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)(A;;0x80;;;BU)"
             .encode_utf16()
             .chain(Some(0))
             .collect();
