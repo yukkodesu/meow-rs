@@ -48,6 +48,18 @@ async fn initialization_is_idle_and_unknown_nested_options_are_reported() {
         Some("clean" | "recovered" | "needsPrivilege" | "failed")
     ));
     assert!(state["recovery"]["details"].is_array());
+    let auth = call(&host, "checkConfig", json!("authentication: ['fixture:local-only']\nskip-auth-prefixes: []\nrules: ['MATCH,DIRECT']\n")).await;
+    assert_eq!(auth["valid"], true);
+    assert!(auth["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|diagnostic| {
+            diagnostic["severity"] == "warning"
+                && diagnostic["path"] == "authentication"
+                && diagnostic["reason"].as_str().unwrap().contains("127.0.0.1")
+                && diagnostic["reason"].as_str().unwrap().contains("::1")
+        }));
     let check = call(&host, "checkConfig", json!("proxies:\n  - name: edge\n    type: vless\n    server: localhost\n    port: 443\n    uuid: 00000000-0000-0000-0000-000000000000\n    reality-opts:\n      public-key: x\n      imaginary: true\n")).await;
     assert_eq!(check["valid"], false);
     assert!(check["diagnostics"]
