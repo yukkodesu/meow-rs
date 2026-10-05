@@ -75,6 +75,28 @@ pub fn recovery_directory() -> io::Result<PathBuf> {
                 ));
             }
         }
+        for name in [
+            "dns.json",
+            "routes.json",
+            "dns.pending",
+            "routes.pending",
+            "resources.lock",
+        ] {
+            let metadata = match fs::symlink_metadata(path.join(name)) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if !metadata.is_file()
+                || metadata.uid() != 0
+                || metadata.permissions().mode() & 0o077 != 0
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Recovery journal must be root-owned, private and not a symlink",
+                ));
+            }
+        }
         Ok(path)
     }
     #[cfg(windows)]

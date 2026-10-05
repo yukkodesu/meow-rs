@@ -40,7 +40,7 @@ foreach ($directory in @($product, $recovery)) {
     Assert-TrustedItem (Get-Item -LiteralPath $directory -Force)
 }
 
-foreach ($name in @('dns.json', 'routes.json', 'dns.pending', 'routes.pending')) {
+foreach ($name in @('dns.json', 'routes.json', 'dns.pending', 'routes.pending', 'resources.lock')) {
     $file = Join-Path $recovery $name
     if (Test-Path -LiteralPath $file) {
         Assert-TrustedItem (Get-Item -LiteralPath $file -Force)
