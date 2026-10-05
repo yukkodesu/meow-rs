@@ -1,6 +1,7 @@
+use anyhow::Context;
 use flclash_meow_host::protocol::{read_frame, write_frame};
 use serde_json::{json, Value};
-use std::{io, path::Path, time::Duration};
+use std::{io, path::Path, process::ExitStatus, time::Duration};
 use tokio::process::{Child, Command};
 
 #[cfg(windows)]
@@ -10,6 +11,9 @@ type Peer = tokio::net::UnixStream;
 
 #[path = "support/native_traffic.rs"]
 mod traffic;
+
+#[path = "support/native_child.rs"]
+mod native_child;
 
 #[cfg(target_os = "macos")]
 #[path = "support/macos_routes.rs"]
@@ -74,7 +78,7 @@ impl Session {
 
     async fn call(&mut self, method: &str, arguments: Value) -> anyhow::Result<Value> {
         let deadline = if method == "startListener" { 360 } else { 90 };
-        tokio::time::timeout(Duration::from_secs(deadline), async {
+        let result = tokio::time::timeout(Duration::from_secs(deadline), async {
             let peer = self.peer.as_mut().ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotConnected, "IPC session has closed")
             })?;
@@ -89,7 +93,7 @@ impl Session {
                 let frame = read_frame(peer).await?.ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::UnexpectedEof,
-                        "Host exited before its native response",
+                        "Host IPC closed before its native response",
                     )
                 })?;
                 let response: Value = serde_json::from_slice(&frame)?;
@@ -100,7 +104,23 @@ impl Session {
                 return Ok(response["result"].clone());
             }
         })
-        .await?
+        .await
+        .map_err(anyhow::Error::from)
+        .and_then(|value| value);
+        if let Err(error) = &result {
+            let child = native_child::observe_exit(&mut self.child, Duration::from_secs(2)).await;
+            println!(
+                "{}",
+                json!({
+                    "phase":"rpcFailure",
+                    "method":method,
+                    "error":format!("{error:#}"),
+                    "child":child.as_ref().ok(),
+                    "childObservationError":child.as_ref().err().map(ToString::to_string),
+                })
+            );
+        }
+        result.with_context(|| format!("Native request {method} failed"))
     }
 
     async fn initialize(&mut self, home: &Path) -> anyhow::Result<Value> {
@@ -122,12 +142,11 @@ impl Session {
         self.call("getRuntimeState", Value::Null).await
     }
 
-    async fn reap(&mut self) -> anyhow::Result<()> {
+    async fn reap(&mut self) -> anyhow::Result<ExitStatus> {
         if self.child.try_wait()?.is_none() {
             self.child.kill().await?;
         }
-        self.child.wait().await?;
-        Ok(())
+        Ok(self.child.wait().await?)
     }
 }
 
@@ -319,6 +338,7 @@ async fn native_tun_stop_exit_and_crash_recovery() {
     }
     std::fs::write(home.path().join("config.yaml"), format!("{geo}mode: rule\nhosts: {{ test.example: 127.0.0.42 }}\nrules: ['MATCH,DIRECT']\ndns:\n  enable: true\n  enhanced-mode: fake-ip\n  fake-ip-range: 198.18.0.1/16\n  nameserver: [{}]\ntun:\n  enable: true\n  auto-route: {}\n  dns-hijack: [any:53]\n", fixtures.dns, if global {"global"} else {"fake-ip"})).unwrap();
     let before = snapshot().unwrap();
+    println!("{}", json!({"phase":"before","snapshot":&before}));
     let mut session = Session::spawn(home.path()).await.unwrap();
     let mut evidence = Vec::new();
     let result = tokio::time::timeout(
@@ -326,12 +346,13 @@ async fn native_tun_stop_exit_and_crash_recovery() {
         exercise(&mut session, home.path(), &mut evidence, &fixtures),
     )
     .await;
+    let pre_reap = session.child.try_wait();
     let reaped = session.reap().await;
     let recovery = flclash_meow_host::native::recover_existing_product_resources();
     let restored = snapshot();
     println!(
         "{}",
-        json!({"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"mode":if global {"global"} else {"fake-ip"},"evidence":evidence,"finallyRecovery":recovery,"finallyState":restored.as_ref().ok(),"scenarioResult":format!("{result:?}")})
+        json!({"platform":std::env::consts::OS,"arch":std::env::consts::ARCH,"mode":if global {"global"} else {"fake-ip"},"evidence":evidence,"before":before,"preReapChild":format!("{pre_reap:?}"),"reapedChild":reaped.as_ref().ok().map(ToString::to_string),"finallyRecovery":recovery,"finallyState":restored.as_ref().ok(),"scenarioResult":format!("{result:?}")})
     );
     reaped.unwrap();
     assert!(
