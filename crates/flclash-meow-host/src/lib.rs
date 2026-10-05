@@ -23,6 +23,9 @@ use tokio::sync::{broadcast, watch, Mutex, Semaphore};
 struct State {
     home: Option<PathBuf>,
     runtime: Option<Runtime>,
+    staged: Option<Runtime>,
+    retired: Option<Runtime>,
+    cleanup_failure: Option<String>,
     document: Option<Value>,
     closed: bool,
     generation: u64,
@@ -144,12 +147,17 @@ impl Host {
         if state.closed {
             return Err(RpcError::new("closed", "The host session has closed"));
         }
+        if matches!(method, "setupConfig" | "updateConfig" | "startListener") {
+            if let Some(failure) = state.cleanup_failure.as_ref() {
+                return Err(RpcError::new("resources_release_unconfirmed", failure));
+            }
+        }
         match method {
             "getCoreInfo" => Ok(
                 json!({"name":"meow-rs","version":env!("MEOW_CORE_VERSION"),"hostVersion":env!("CARGO_PKG_VERSION"),"commit":env!("MEOW_HOST_COMMIT"),"protocolVersion":1,"capabilities":["config-check","proxy-groups","delay","providers","connections","traffic","logs","dns-cache","tun-fake-ip","tun-global-experimental","external-controller"],"statisticsScope":"all","connectionsScope":"tcp","tunModes":["fake-ip","global-experimental"]}),
             ),
             "getRuntimeState" => {
-                let mut result = json!({"initialized":state.home.is_some(),"configured":state.runtime.is_some(),"running":state.runtime.as_ref().is_some_and(Runtime::running),"tunActive":state.runtime.as_ref().is_some_and(|r|r.state.tunnel.has_tun()),"generation":state.generation,"failure":state.runtime.as_ref().and_then(Runtime::failure)});
+                let mut result = json!({"initialized":state.home.is_some(),"configured":state.runtime.is_some(),"running":state.runtime.as_ref().is_some_and(Runtime::running),"tunActive":state.runtime.as_ref().is_some_and(|r|r.state.tunnel.has_tun()),"generation":state.generation,"failure":state.cleanup_failure.clone().or_else(||state.runtime.as_ref().and_then(Runtime::failure))});
                 let endpoints = state.runtime.as_ref().map_or_else(
                     || json!({"listeners":[],"dnsListen":null,"externalController":null}),
                     Runtime::endpoints,
@@ -250,9 +258,7 @@ impl Host {
                 Ok(json!(runtime.running()))
             }
             "stopListener" => {
-                if let Some(runtime) = state.runtime.as_mut() {
-                    runtime.stop().await;
-                }
+                Self::stop_owned(&mut state).await;
                 Ok(json!(true))
             }
             "getTraffic" | "getTotalTraffic" => {
@@ -419,18 +425,21 @@ impl Host {
             .unwrap_or_else(|| "info".into());
         meow_api::log_stream::reload_log_level(&level)
             .map_err(|error| RpcError::new("log_configuration_failed", error))?;
-        let mut previous = state.runtime.take();
-        if let Some(old) = previous.as_mut() {
+        state.staged = Some(candidate);
+        if let Some(old) = state.runtime.as_mut() {
             old.stop().await;
         }
+        state.retired = state.runtime.take();
+        state.runtime = state.staged.take();
         if self.wanted.load(Ordering::Acquire) {
-            if let Err(error) = candidate.start().await {
-                candidate.stop().await;
+            if let Err(error) = state.runtime.as_mut().expect("staged runtime").start().await {
+                state.runtime.as_mut().expect("staged runtime").stop().await;
                 if let Err(error) = meow_api::log_stream::reload_log_level(&previous_level) {
                     tracing::error!("Previous log filter could not be restored: {error}");
                 }
+                state.runtime = state.retired.take();
                 let rollback = if self.wanted.load(Ordering::Acquire) {
-                    if let Some(old) = previous.as_mut() {
+                    if let Some(old) = state.runtime.as_mut() {
                         old.start().await.map(|()| true)
                     } else {
                         Ok(false)
@@ -438,16 +447,15 @@ impl Host {
                 } else {
                     Ok(false)
                 };
-                state.runtime = previous;
                 let mut error = RpcError::new("config_apply_failed", error.message);
                 error.details = json!({"restored":matches!(rollback,Ok(true)),"rollbackError":rollback.err().map(|e|e.message)});
                 return Err(error);
             }
         }
         if !self.wanted.load(Ordering::Acquire) {
-            candidate.stop().await;
+            Self::stop_owned(state).await;
         }
-        state.runtime = Some(candidate);
+        state.retired = None;
         state.document = Some(
             serde_yaml::from_str(content)
                 .map_err(|e| RpcError::new("invalid_config", e.to_string()))?,
@@ -473,11 +481,17 @@ impl Host {
     async fn shutdown_locked(&self, state: &mut State) {
         self.wanted.store(false, Ordering::Release);
         self.generation.send_modify(|g| *g += 1);
-        if let Some(runtime) = state.runtime.as_mut() {
+        Self::stop_owned(state).await;
+        state.runtime = None;
+        state.staged = None;
+        state.retired = None;
+        state.closed = true;
+    }
+
+    async fn stop_owned(state: &mut State) {
+        for runtime in [&mut state.runtime, &mut state.staged, &mut state.retired].into_iter().flatten() {
             runtime.stop().await;
         }
-        state.runtime = None;
-        state.closed = true;
     }
     pub async fn shutdown(&self) {
         let mut state = self.state.lock().await;
