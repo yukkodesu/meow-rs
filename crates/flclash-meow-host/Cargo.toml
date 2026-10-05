@@ -20,6 +20,8 @@ meow-dns = { workspace = true, features = ["dns-server", "encrypted"] }
 meow-listener = { workspace = true, features = ["listener-mixed", "listener-http", "listener-socks5", "listener-tun"] }
 meow-tunnel.workspace = true
 meow-api = { workspace = true, features = ["listener-tun"] }
+meow-app = { path = "../meow-app", default-features = false }
+time.workspace = true
 parking_lot.workspace = true
 dashmap.workspace = true
 axum.workspace = true

@@ -148,9 +148,18 @@ impl Host {
             "getCoreInfo" => Ok(
                 json!({"name":"meow-rs","version":env!("MEOW_CORE_VERSION"),"hostVersion":env!("CARGO_PKG_VERSION"),"commit":env!("MEOW_HOST_COMMIT"),"protocolVersion":1,"capabilities":["config-check","proxy-groups","delay","providers","connections","traffic","logs","dns-cache","tun-fake-ip","tun-global-experimental","external-controller"],"statisticsScope":"all","connectionsScope":"tcp","tunModes":["fake-ip","global-experimental"]}),
             ),
-            "getRuntimeState" => Ok(
-                json!({"initialized":state.home.is_some(),"configured":state.runtime.is_some(),"running":state.runtime.as_ref().is_some_and(Runtime::running),"tunActive":state.runtime.as_ref().is_some_and(|r|r.state.tunnel.has_tun()),"generation":state.generation,"failure":state.runtime.as_ref().and_then(Runtime::failure)}),
-            ),
+            "getRuntimeState" => {
+                let mut result = json!({"initialized":state.home.is_some(),"configured":state.runtime.is_some(),"running":state.runtime.as_ref().is_some_and(Runtime::running),"tunActive":state.runtime.as_ref().is_some_and(|r|r.state.tunnel.has_tun()),"generation":state.generation,"failure":state.runtime.as_ref().and_then(Runtime::failure)});
+                let endpoints = state.runtime.as_ref().map_or_else(
+                    || json!({"listeners":[],"dnsListen":null,"externalController":null}),
+                    Runtime::endpoints,
+                );
+                result
+                    .as_object_mut()
+                    .expect("runtime state object")
+                    .extend(endpoints.as_object().expect("endpoint object").clone());
+                Ok(result)
+            }
             "getIsInit" => Ok(json!(state.home.is_some())),
             "initClash" => {
                 let home = string_field(&arguments, "home-dir")?;
@@ -264,9 +273,7 @@ impl Host {
                         down.saturating_sub(state.traffic_baseline.1),
                     )
                 } else {
-                    statistics.sample_traffic();
-                    let (up, down, _, _) = statistics.traffic_snapshot();
-                    (up, down)
+                    runtime.traffic()
                 };
                 Ok(json!({"up":up,"down":down}))
             }
@@ -380,10 +387,11 @@ impl Host {
         let binding = meow_api::preinstall_global_route_binding(&raw);
         let mut generation = self.generation.subscribe();
         let config = tokio::select! {
-            config=meow_config::build_config(raw,Some(home))=>config.map_err(|e|RpcError::new("invalid_config",e.to_string()))?,
+            config=Box::pin(meow_config::build_config(raw,Some(home)))=>config.map_err(|e|RpcError::new("invalid_config",e.to_string()))?,
             _=generation.changed()=>return Err(RpcError::new("request_superseded","A later runtime intent superseded configuration preparation")),
         };
-        let mut candidate = Runtime::prepare(config, self.log_tx.clone(), Some(binding));
+        let mut candidate =
+            Runtime::prepare(config, self.log_tx.clone(), Some(binding), home.clone());
         if let Some(selections) = selections.get("selected-map").and_then(Value::as_object) {
             for (group, node) in selections {
                 if let (Some(proxy), Some(node)) =
@@ -397,6 +405,20 @@ impl Host {
                 }
             }
         }
+        let level = candidate
+            .state
+            .raw_config
+            .read()
+            .log_level
+            .clone()
+            .unwrap_or_else(|| "info".into());
+        let previous_level = state
+            .runtime
+            .as_ref()
+            .and_then(|runtime| runtime.state.raw_config.read().log_level.clone())
+            .unwrap_or_else(|| "info".into());
+        meow_api::log_stream::reload_log_level(&level)
+            .map_err(|error| RpcError::new("log_configuration_failed", error))?;
         let mut previous = state.runtime.take();
         if let Some(old) = previous.as_mut() {
             old.stop().await;
@@ -404,6 +426,9 @@ impl Host {
         if self.wanted.load(Ordering::Acquire) {
             if let Err(error) = candidate.start().await {
                 candidate.stop().await;
+                if let Err(error) = meow_api::log_stream::reload_log_level(&previous_level) {
+                    tracing::error!("Previous log filter could not be restored: {error}");
+                }
                 let rollback = if self.wanted.load(Ordering::Acquire) {
                     if let Some(old) = previous.as_mut() {
                         old.start().await.map(|()| true)
@@ -481,5 +506,5 @@ fn ensure_valid(check: &config::CheckResult) -> Result<(), RpcError> {
     }
 }
 fn log_value(log: &LogMessage) -> Value {
-    json!({"LogLevel":log.level.as_str(),"Payload":log.payload,"dateTime":log.time.to_string(),"source":"core"})
+    json!({"LogLevel":log.level.as_str(),"Payload":log.payload,"dateTime":log.time.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),"source":"core"})
 }
