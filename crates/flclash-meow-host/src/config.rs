@@ -36,6 +36,18 @@ pub fn parse(content: &str, home: Option<&Path>) -> Result<(RawConfig, CheckResu
         .apply_merge()
         .map_err(|e| RpcError::new("invalid_config", e.to_string()))?;
     let mut diagnostics = Vec::new();
+    if raw
+        .authentication
+        .as_ref()
+        .is_some_and(|entries| !entries.is_empty())
+    {
+        diagnostics.push(Diagnostic {
+            severity: "warning",
+            path: "authentication".into(),
+            reason: "meow-rs always bypasses proxy authentication for 127.0.0.1/32 and ::1/128. skip-auth-prefixes only adds bypasses; it cannot disable these defaults.".into(),
+            suggestion: "Do not rely on proxy authentication to restrict these local callers.",
+        });
+    }
     if let Some(level) = raw.log_level.as_deref() {
         if !meow_api::log_stream::is_valid_log_level(level) {
             diagnostics.push(problem("log-level", "Unsupported log level"));

@@ -173,6 +173,13 @@ impl Host {
             if let Some(failure) = state.cleanup_failure.as_ref() {
                 return Err(RpcError::new("resources_release_unconfirmed", failure));
             }
+            if state
+                .runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.state.tunnel.tun_cleanup_result().is_err())
+            {
+                Self::stop_owned(&mut state).await?;
+            }
         }
         match method {
             "getCoreInfo" => Ok(
