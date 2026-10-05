@@ -12,10 +12,11 @@ impl Host {
         if state.closed {
             return Err(RpcError::new("closed", "The host session has closed"));
         }
-        if matches!(
+        let requires_clean_resources = matches!(
             method,
             "changeProxy" | "unfixProxy" | "asyncTestDelay" | "updateExternalProvider"
-        ) {
+        );
+        if requires_clean_resources {
             if let Some(failure) = state.cleanup_failure.as_ref() {
                 return Err(RpcError::new("resources_release_unconfirmed", failure));
             }
@@ -24,6 +25,11 @@ impl Host {
             .runtime
             .as_ref()
             .ok_or_else(|| RpcError::new("not_configured", "No profile is configured"))?;
+        if requires_clean_resources {
+            runtime.state.tunnel.tun_cleanup_result().map_err(|error| {
+                RpcError::new("resources_release_unconfirmed", error.to_string())
+            })?;
+        }
         let router = runtime.router.clone();
         let app = Arc::clone(&runtime.state);
         let mut generation = self.generation.subscribe();

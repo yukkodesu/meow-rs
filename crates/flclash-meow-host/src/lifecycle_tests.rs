@@ -52,6 +52,17 @@ async fn cleanup_failure_retains_the_session_and_prevents_runtime_replacement() 
         .as_str()
         .unwrap()
         .contains("fixture route restoration failure"));
+    for method in [
+        "changeProxy",
+        "unfixProxy",
+        "asyncTestDelay",
+        "updateExternalProvider",
+    ] {
+        assert_eq!(
+            call(&host, method, Value::Null).await.error.unwrap().code,
+            "resources_release_unconfirmed"
+        );
+    }
     let replacement = call(&host, "setupConfig", Value::Null).await;
     assert_eq!(
         replacement.error.unwrap().code,
