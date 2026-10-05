@@ -72,9 +72,7 @@ mod native {
     }
 
     pub(super) fn plan(_: IpAddr) -> io::Result<Vec<(String, String)>> {
-        let output = run(
-            r#"$ids = @(Get-NetAdapter | ForEach-Object { $adapter = $_; foreach ($family in 'IPv4','IPv6') { $dns = Get-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -AddressFamily $family; if ($dns.ServerAddresses.Count -gt 0) { $adapter.InterfaceGuid.ToString() + '|' + $family } } }); ConvertTo-Json -InputObject $ids -Compress"#,
-        )?;
+        let output = run(include_str!("windows_dns_plan.ps1"))?;
         let ids: Vec<String> = serde_json::from_str(&output).map_err(io::Error::other)?;
         ids.into_iter()
             .map(|id| {
