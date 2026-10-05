@@ -60,20 +60,21 @@ pub fn recovery_directory() -> io::Result<PathBuf> {
             .ok_or_else(|| io::Error::other("Invalid recovery directory"))?;
         for directory in [parent, path.as_path()] {
             match fs::create_dir(directory) {
-                Ok(()) => fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?,
+                Ok(()) => fs::set_permissions(directory, fs::Permissions::from_mode(0o711))?,
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error),
             }
             let metadata = fs::symlink_metadata(directory)?;
             if !metadata.is_dir()
                 || metadata.uid() != 0
-                || metadata.permissions().mode() & 0o077 != 0
+                || metadata.permissions().mode() & 0o022 != 0
             {
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "Recovery directory must be root-owned, private and not a symlink",
+                    "Recovery directory must be root-owned, protected from other writers and not a symlink",
                 ));
             }
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o711))?;
         }
         for name in [
             "dns.json",
