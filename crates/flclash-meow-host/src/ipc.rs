@@ -14,6 +14,15 @@ pub async fn serve<S>(host: Arc<Host>, stream: S) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    serve_until(host, stream, std::future::pending()).await
+}
+
+pub async fn serve_until<S, F>(host: Arc<Host>, stream: S, cancellation: F) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    F: std::future::Future<Output = ()> + Send,
+{
+    tokio::pin!(cancellation);
     let (reader, writer) = tokio::io::split(stream);
     let (outgoing, responses) = mpsc::channel::<(Value, Option<oneshot::Sender<()>>)>(64);
     let (closed, mut closed_rx) = mpsc::channel(1);
@@ -37,13 +46,16 @@ where
     let mut reader = reader;
     let mut requests = JoinSet::new();
     let capacity = Arc::new(Semaphore::new(64));
+    let payload_budget = Arc::new(Semaphore::new(crate::protocol::MAX_FRAME_SIZE));
     let outcome = loop {
         tokio::select! {
+            _=&mut cancellation=>break Ok(()),
             result=&mut writer_task=>break result.unwrap_or_else(|e|Err(io::Error::other(e))),
             _=closed_rx.recv()=>break Ok(()),
             completed=requests.join_next(),if !requests.is_empty()=>{if let Some(Err(e))=completed {tracing::warn!("RPC request ended: {e}");}},
             frame=read_frame(&mut reader)=>{
                 let frame=match frame {Ok(Some(frame))=>frame,Ok(None)=>break Ok(()),Err(e)=>break Err(e)};
+                let payload = Arc::clone(&payload_budget).try_acquire_many_owned(frame.len().try_into().map_err(io::Error::other)?);
                 let request=match serde_json::from_slice::<Request>(&frame) {
                     Ok(request)=>request,
                     Err(error)=>{
@@ -51,6 +63,11 @@ where
                         if outgoing.send((serde_json::to_value(response).map_err(io::Error::other)?,None)).await.is_err() {break Err(io::Error::new(io::ErrorKind::BrokenPipe,"IPC writer exited"));}
                         continue;
                     }
+                };
+                let Ok(payload) = payload else {
+                    let response=Response{id:request.id,result:Value::Null,error:Some(RpcError::new("busy","Pending RPC payload budget exhausted"))};
+                    if outgoing.send((serde_json::to_value(response).map_err(io::Error::other)?,None)).await.is_err() {break Err(io::Error::new(io::ErrorKind::BrokenPipe,"IPC writer exited"));}
+                    continue;
                 };
                 let Ok(permit)=Arc::clone(&capacity).try_acquire_owned() else {
                         let response=Response{id:request.id,result:Value::Null,error:Some(RpcError::new("busy","Too many pending RPC requests"))};
@@ -67,6 +84,7 @@ where
                         let _=received.await;let _=closed.send(()).await;
                     }else if let Ok(value)=serde_json::to_value(response) {let _=outgoing.send((value,None)).await;}
                     drop(permit);
+                    drop(payload);
                 });
             }
         }
@@ -76,6 +94,9 @@ where
     log_task.abort();
     writer_task.abort();
     let _ = log_task.await;
+    if !writer_task.is_finished() {
+        let _ = writer_task.await;
+    }
     host.shutdown().await;
     outcome
 }

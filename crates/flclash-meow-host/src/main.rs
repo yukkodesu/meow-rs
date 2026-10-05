@@ -1,4 +1,4 @@
-use flclash_meow_host::{serve, Host};
+use flclash_meow_host::{ipc::serve_until, Host};
 use std::sync::Arc;
 use tracing_subscriber::prelude::*;
 
@@ -16,7 +16,14 @@ async fn main() -> anyhow::Result<()> {
         );
         return Ok(());
     }
+    #[cfg(windows)]
+    let stream = connect(&address).await?;
+    #[cfg(unix)]
+    let (stream, uid, gid) = connect(&address).await?;
+    #[cfg(windows)]
     let host = Arc::new(Host::new());
+    #[cfg(unix)]
+    let host = Arc::new(Host::with_peer_identity(uid, gid));
     let (filter, reload) =
         tracing_subscriber::reload::Layer::new(tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::registry()
@@ -36,9 +43,7 @@ async fn main() -> anyhow::Result<()> {
             .reload(tracing_subscriber::EnvFilter::try_new(level).map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string())
     });
-    let stream = connect(&address).await?;
-    let result =
-        tokio::select! {result=serve(Arc::clone(&host),stream)=>result,_=shutdown_signal()=>Ok(())};
+    let result = serve_until(Arc::clone(&host), stream, shutdown_signal()).await;
     host.shutdown().await;
     result?;
     Ok(())
@@ -69,8 +74,8 @@ async fn connect(
 }
 
 #[cfg(unix)]
-async fn connect(address: &str) -> anyhow::Result<tokio::net::UnixStream> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+async fn connect(address: &str) -> anyhow::Result<(tokio::net::UnixStream, u32, u32)> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     let path = std::path::Path::new(address);
     anyhow::ensure!(
         path.file_name()
@@ -79,6 +84,10 @@ async fn connect(address: &str) -> anyhow::Result<tokio::net::UnixStream> {
         "Unexpected product IPC address"
     );
     let metadata = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        metadata.file_type().is_socket(),
+        "IPC path must be a socket, not a link"
+    );
     anyhow::ensure!(
         metadata.permissions().mode() & 0o077 == 0,
         "IPC socket must be private to its owner"
@@ -89,7 +98,7 @@ async fn connect(address: &str) -> anyhow::Result<tokio::net::UnixStream> {
         peer.uid() == metadata.uid(),
         "IPC peer does not own the socket"
     );
-    Ok(stream)
+    Ok((stream, peer.uid(), peer.gid()))
 }
 
 async fn shutdown_signal() {

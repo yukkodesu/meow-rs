@@ -3,50 +3,121 @@
 //! v1 deliberately routes only the fake-IP range into the device (see the
 //! module docs in `mod.rs` for the loop-freedom argument). Routes are added
 //! with the blocking `route_manager` API at listener startup and removed on
-//! drop; a failed add is a warning, not a fatal error, because the device
-//! subnet's own on-link route frequently already covers the range (in which
-//! case some platforms report "route exists").
+//! drop. A failed installation aborts startup and rolls back only this
+//! listener's changes.
 
+use super::ownership::{OwnedResources, ResourceBackend};
 use ipnet::IpNet;
+use meow_tunnel::Tunnel;
 use route_manager::{Route, RouteManager};
+use std::path::PathBuf;
 use tracing::{debug, warn};
 
 pub(super) struct RouteGuard {
-    manager: RouteManager,
-    installed: Vec<Route>,
+    resources: OwnedResources<NativeRoutes>,
+    tunnel: Tunnel,
 }
 
 impl RouteGuard {
     /// Install one on-link route per net through interface `if_index`.
-    /// Individual failures are logged and skipped so a pre-existing
-    /// equivalent route does not abort listener startup.
-    pub(super) fn setup(if_index: u32, nets: &[IpNet]) -> std::io::Result<Self> {
-        let mut manager = RouteManager::new()?;
-        let mut installed = Vec::with_capacity(nets.len());
+    pub(super) fn setup(
+        if_index: u32,
+        name: &str,
+        nets: &[IpNet],
+        journal: Option<PathBuf>,
+        tunnel: Tunnel,
+    ) -> std::io::Result<Self> {
+        let mut plan = Vec::with_capacity(nets.len());
         for net in nets {
-            let route = Route::new(net.network(), net.prefix_len()).with_if_index(if_index);
-            match manager.add(&route) {
-                Ok(()) => {
-                    debug!("tun auto-route: added {net} via if_index {if_index}");
-                    installed.push(route);
-                }
-                Err(e) => warn!(
-                    "tun auto-route: failed to add {net} via if_index {if_index}: {e} \
-                     (continuing — the device subnet may already cover it)"
-                ),
-            }
+            let route = owned_route(*net, if_index, name.to_string());
+            let resource = serde_json::to_string(&(net.to_string(), if_index, &name))
+                .map_err(std::io::Error::other)?;
+            plan.push((resource, fingerprint(&route)?));
         }
-        Ok(Self { manager, installed })
+        let backend = NativeRoutes(RouteManager::new()?);
+        let resources = OwnedResources::install(backend, journal, plan, false)?;
+        debug!("tun routes installed through interface {if_index}");
+        Ok(Self { resources, tunnel })
     }
 }
 
 impl Drop for RouteGuard {
     fn drop(&mut self) {
-        for route in &self.installed {
-            if let Err(e) = self.manager.delete(route) {
-                warn!("tun auto-route: failed to remove {route}: {e}");
-            }
+        if let Err(error) = self.resources.cleanup() {
+            self.tunnel
+                .report_tun_cleanup_failure(format!("Route restoration: {error}"));
+            warn!("tun route cleanup failed: {error}");
         }
+    }
+}
+
+struct NativeRoutes(RouteManager);
+
+pub(super) fn recover(path: &std::path::Path) -> std::io::Result<()> {
+    OwnedResources::recover(&mut NativeRoutes(RouteManager::new()?), path)
+}
+
+fn owned_route(net: IpNet, index: u32, name: String) -> Route {
+    let route = Route::new(net.network(), net.prefix_len())
+        .with_if_index(index)
+        .with_if_name(name);
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    let route = route.with_metric(0);
+    route
+}
+
+fn fingerprint(route: &Route) -> std::io::Result<String> {
+    let gateway = route.gateway().filter(|ip| !ip.is_unspecified());
+    #[cfg(any(target_os = "windows", target_os = "linux"))]
+    let metric = route.metric().unwrap_or(0);
+    #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+    let metric = 0u32;
+    #[cfg(target_os = "linux")]
+    let extra = (
+        if matches!(route.table(), 0 | 254) {
+            254
+        } else {
+            route.table()
+        },
+        route.source(),
+        route.source_prefix(),
+        route.pref_source(),
+    );
+    #[cfg(not(target_os = "linux"))]
+    let extra = ();
+    serde_json::to_string(&(gateway, metric, extra)).map_err(std::io::Error::other)
+}
+
+impl ResourceBackend for NativeRoutes {
+    fn read(&mut self, resource: &str) -> std::io::Result<Option<String>> {
+        let (net, index, name): (String, u32, String) =
+            serde_json::from_str(resource).map_err(std::io::Error::other)?;
+        let net: IpNet = net.parse().map_err(std::io::Error::other)?;
+        let mut matches = self.0.list()?.into_iter().filter(|route| {
+            route.destination() == net.network()
+                && route.prefix() == net.prefix_len()
+                && route.if_index() == Some(index)
+                && route.if_name() == Some(&name)
+        });
+        let first = matches.next();
+        if matches.next().is_some() {
+            return Err(std::io::Error::other("Ambiguous owned route"));
+        }
+        first.as_ref().map(fingerprint).transpose()
+    }
+    fn write(&mut self, resource: &str, value: Option<&str>) -> std::io::Result<()> {
+        let (net, index, name): (String, u32, String) =
+            serde_json::from_str(resource).map_err(std::io::Error::other)?;
+        let net: IpNet = net.parse().map_err(std::io::Error::other)?;
+        let route = owned_route(net, index, name);
+        match value {
+            Some(value) if value == fingerprint(&route)? => self.0.add(&route),
+            Some(_) => Err(std::io::Error::other("Invalid route journal value")),
+            None => self.0.delete(&route),
+        }
+    }
+    fn owner_alive(&self, pid: u32) -> std::io::Result<bool> {
+        super::ownership::owner_alive(pid)
     }
 }
 

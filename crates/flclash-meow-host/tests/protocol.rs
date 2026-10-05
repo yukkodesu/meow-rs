@@ -66,3 +66,22 @@ async fn session_shutdown_flushes_correlated_acknowledgement_before_eof() {
     assert!(read_frame(&mut peer).await.unwrap().is_none());
     session.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn external_shutdown_finishes_the_owned_session() {
+    use flclash_meow_host::{ipc::serve_until, Host};
+    use std::sync::Arc;
+    let (mut peer, stream) = tokio::io::duplex(32);
+    let host = Arc::new(Host::new());
+    let (stop, cancellation) = tokio::sync::oneshot::channel();
+    let session = tokio::spawn(serve_until(host, stream, async move {
+        let _ = cancellation.await;
+    }));
+    write_frame(&mut peer, br#"{"id":"alive","method":"getCoreInfo"}"#)
+        .await
+        .unwrap();
+    assert!(read_frame(&mut peer).await.unwrap().is_some());
+    stop.send(()).unwrap();
+    assert!(read_frame(&mut peer).await.unwrap().is_none());
+    session.await.unwrap().unwrap();
+}

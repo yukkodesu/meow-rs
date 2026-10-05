@@ -56,6 +56,8 @@ ipnet = { workspace = true, optional = true }
 shadowsocks = { workspace = true, optional = true }
 meow-transport = { workspace = true, optional = true }
 parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 meow-config = { workspace = true }
@@ -68,6 +70,7 @@ shadowsocks = { workspace = true }
 async-trait = { workspace = true }
 tracing-subscriber = { workspace = true }
 smol_str = { workspace = true }
+tempfile.workspace = true
 
 [[test]]
 name = "ss_listener_integration"
