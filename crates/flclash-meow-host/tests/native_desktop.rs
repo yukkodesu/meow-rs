@@ -130,9 +130,9 @@ impl Session {
 fn snapshot() -> anyhow::Result<Value> {
     #[cfg(windows)]
     {
-        let dns = meow_listener::tun::ownership::powershell(
-            r#"$result=@(Get-NetAdapter | Sort-Object InterfaceGuid | ForEach-Object {$adapter=$_; foreach($family in 'Tcpip','Tcpip6') {$key=Get-Item ('HKLM:\SYSTEM\CurrentControlSet\Services\'+$family+'\Parameters\Interfaces\{'+$adapter.InterfaceGuid.ToString()+'}') -ErrorAction SilentlyContinue; if($key) {[pscustomobject]@{adapter=$adapter.InterfaceGuid.ToString();family=$family;servers=$key.GetValue('NameServer','')}}}}); ConvertTo-Json -InputObject $result -Compress"#,
-        )?;
+        let dns = meow_listener::tun::ownership::powershell(include_str!(
+            "fixtures/windows_dns_snapshot.ps1"
+        ))?;
         let routes = meow_listener::tun::ownership::powershell(
             r#"$result=@(Get-NetRoute | Select-Object DestinationPrefix,NextHop,InterfaceIndex,RouteMetric | Sort-Object DestinationPrefix,NextHop,InterfaceIndex,RouteMetric); ConvertTo-Json -InputObject $result -Compress"#,
         )?;
