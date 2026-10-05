@@ -3,6 +3,9 @@ use std::{fs, io, path::PathBuf};
 
 pub fn recover_existing_product_resources() -> RecoveryStatus {
     let result = (|| {
+        #[cfg(unix)]
+        let path = product_recovery_path();
+        #[cfg(windows)]
         let path = product_recovery_path()?;
         match fs::symlink_metadata(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -50,11 +53,7 @@ pub fn recovery_directory() -> io::Result<PathBuf> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let path = PathBuf::from(if cfg!(target_os = "macos") {
-            "/Library/Application Support/FlClash-Meow/tun"
-        } else {
-            "/var/lib/flclash-meow/tun"
-        });
+        let path = product_recovery_path();
         let parent = path
             .parent()
             .ok_or_else(|| io::Error::other("Invalid recovery directory"))?;
@@ -109,21 +108,20 @@ pub fn recovery_directory() -> io::Result<PathBuf> {
     }
 }
 
+#[cfg(unix)]
+fn product_recovery_path() -> PathBuf {
+    PathBuf::from(if cfg!(target_os = "macos") {
+        "/Library/Application Support/FlClash-Meow/tun"
+    } else {
+        "/var/lib/flclash-meow/tun"
+    })
+}
+
+#[cfg(windows)]
 fn product_recovery_path() -> io::Result<PathBuf> {
-    #[cfg(unix)]
-    {
-        Ok(PathBuf::from(if cfg!(target_os = "macos") {
-            "/Library/Application Support/FlClash-Meow/tun"
-        } else {
-            "/var/lib/flclash-meow/tun"
-        }))
-    }
-    #[cfg(windows)]
-    {
-        Ok(PathBuf::from(meow_listener::tun::ownership::powershell(
-            "Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'FlClash-Meow/tun'",
-        )?))
-    }
+    Ok(PathBuf::from(meow_listener::tun::ownership::powershell(
+        "Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'FlClash-Meow/tun'",
+    )?))
 }
 
 fn privileged() -> bool {
