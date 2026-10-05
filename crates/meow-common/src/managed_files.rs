@@ -8,12 +8,27 @@ mod unix;
 #[cfg(unix)]
 pub use unix::{authorize_home, ManagedHome};
 
+#[cfg(windows)]
+#[path = "managed_files/windows.rs"]
+mod windows;
+#[cfg(windows)]
+#[path = "managed_files/windows_caller.rs"]
+mod windows_caller;
+#[cfg(windows)]
+pub use windows::{authorize_home_windows, ManagedHome};
+#[cfg(windows)]
+pub use windows_caller::WindowsCaller;
+
 pub fn is_managed() -> bool {
     #[cfg(unix)]
     {
         unix::home().is_some()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows::home().is_some()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         false
     }
@@ -22,6 +37,10 @@ pub fn is_managed() -> bool {
 pub fn open(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     if let Some(home) = unix::home() {
+        return home.open_file(path);
+    }
+    #[cfg(windows)]
+    if let Some(home) = windows::home() {
         return home.open_file(path);
     }
     File::open(path)
@@ -55,7 +74,11 @@ pub fn write_atomic_if_managed(path: &Path, bytes: &[u8]) -> Option<io::Result<(
     {
         unix::home().map(|home| home.write_atomic(path, bytes))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows::home().map(|home| home.write_atomic(path, bytes))
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (path, bytes);
         None
