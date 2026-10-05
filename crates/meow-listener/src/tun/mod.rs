@@ -121,6 +121,16 @@ pub struct RecoveryStatus {
 }
 
 pub fn recover_tun_resources(path: &std::path::Path) -> io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
+    let _lease = ownership::JournalLease::acquire(path)?;
+    recover_tun_resources_locked(path)
+}
+
+fn recover_tun_resources_locked(path: &std::path::Path) -> io::Result<bool> {
     let outcome = (|| {
         match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -454,9 +464,13 @@ impl TunListener {
 
     pub async fn run(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let _resources = self.tunnel.retain_tun_resources();
+        let _lease = self
+            .recovery_directory
+            .as_ref()
+            .map(|directory| ownership::JournalLease::acquire(directory))
+            .transpose()?;
         if let Some(directory) = self.recovery_directory.as_ref() {
-            dns::recover(&directory.join("dns.json"))?;
-            route::recover(&directory.join("routes.json"))?;
+            recover_tun_resources_locked(directory)?;
         }
         // Extract the readiness sender into a notifier so setup failures
         // reach the caller immediately: an `Err` from `run_inner` sends

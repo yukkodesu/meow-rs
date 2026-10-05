@@ -16,6 +16,94 @@ pub trait ResourceBackend {
     }
 }
 
+pub struct JournalLease(fs::File);
+
+impl JournalLease {
+    pub fn acquire(directory: &Path) -> io::Result<Self> {
+        let path = directory.join("resources.lock");
+        let file = match create_privileged_journal(&path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                let mut options = fs::OpenOptions::new();
+                options.read(true).write(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.custom_flags(libc::O_NOFOLLOW);
+                }
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    options.custom_flags(
+                        windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT,
+                    );
+                }
+                options.open(path)?
+            }
+            Err(error) => return Err(error),
+        };
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("Journal lease is not a regular file"));
+        }
+        Self::lock(file)
+    }
+
+    pub fn lock(file: fs::File) -> io::Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::{Storage::FileSystem::LockFileEx, System::IO::OVERLAPPED};
+            let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+            if unsafe {
+                LockFileEx(
+                    file.as_raw_handle(),
+                    3,
+                    0,
+                    u32::MAX,
+                    u32::MAX,
+                    &mut overlapped,
+                )
+            } == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(Self(file))
+    }
+}
+
+impl Drop for JournalLease {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::{Storage::FileSystem::UnlockFileEx, System::IO::OVERLAPPED};
+            let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+            unsafe {
+                UnlockFileEx(
+                    self.0.as_raw_handle(),
+                    0,
+                    u32::MAX,
+                    u32::MAX,
+                    &mut overlapped,
+                )
+            };
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct Change {
     resource: String,
