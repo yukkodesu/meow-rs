@@ -85,3 +85,26 @@ async fn external_shutdown_finishes_the_owned_session() {
     assert!(read_frame(&mut peer).await.unwrap().is_none());
     session.await.unwrap().unwrap();
 }
+
+#[tokio::test]
+async fn external_shutdown_releases_a_session_when_the_peer_stops_reading() {
+    use flclash_meow_host::{serve_until, Host};
+    use std::{sync::Arc, time::Duration};
+    let (mut peer, stream) = tokio::io::duplex(32);
+    let (stop, cancellation) = tokio::sync::oneshot::channel();
+    let session = tokio::spawn(serve_until(Arc::new(Host::new()), stream, async move {
+        let _ = cancellation.await;
+    }));
+    for _ in 0..70 {
+        tokio::time::timeout(Duration::from_secs(1), write_frame(&mut peer, b"{"))
+            .await
+            .unwrap()
+            .unwrap();
+    }
+    stop.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), session)
+        .await
+        .expect("A stalled response queue must not prevent session shutdown")
+        .unwrap()
+        .unwrap();
+}
