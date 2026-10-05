@@ -10,6 +10,7 @@ pub(super) struct DnsGuard {
 impl DnsGuard {
     pub(super) fn setup(
         dns_addr: IpAddr,
+        interface_index: u32,
         journal: Option<PathBuf>,
         tunnel: Tunnel,
     ) -> io::Result<Self> {
@@ -17,7 +18,7 @@ impl DnsGuard {
         if let Some(path) = journal.as_ref() {
             OwnedResources::recover(&mut backend, path)?;
         }
-        let plan = backend.plan(dns_addr)?;
+        let plan = backend.plan(dns_addr, interface_index)?;
         let resources = OwnedResources::install(backend, journal, plan, true)?;
         Ok(Self { resources, tunnel })
     }
@@ -58,8 +59,8 @@ impl ResourceBackend for NativeDns {
 }
 
 impl NativeDns {
-    fn plan(&self, address: IpAddr) -> io::Result<Vec<(String, String)>> {
-        native::plan(address)
+    fn plan(&self, address: IpAddr, interface_index: u32) -> io::Result<Vec<(String, String)>> {
+        native::plan(address, interface_index)
     }
 }
 
@@ -71,8 +72,11 @@ mod native {
         super::super::ownership::powershell(script)
     }
 
-    pub(super) fn plan(_: IpAddr) -> io::Result<Vec<(String, String)>> {
-        let output = run(include_str!("windows_dns_plan.ps1"))?;
+    pub(super) fn plan(_: IpAddr, interface_index: u32) -> io::Result<Vec<(String, String)>> {
+        let output = run(&format!(
+            "$excludedInterfaceIndex = {interface_index};\n{}",
+            include_str!("windows_dns_plan.ps1")
+        ))?;
         let ids: Vec<String> = serde_json::from_str(&output).map_err(io::Error::other)?;
         ids.into_iter()
             .map(|id| {
@@ -163,7 +167,7 @@ mod native {
         Ok(stdout)
     }
 
-    pub(super) fn plan(address: IpAddr) -> io::Result<Vec<(String, String)>> {
+    pub(super) fn plan(address: IpAddr, _: u32) -> io::Result<Vec<(String, String)>> {
         let services = super::networksetup::parse_services(&run(&["-listallnetworkservices"])?);
         let installed = serde_json::to_string(&[address]).map_err(io::Error::other)?;
         Ok(services
@@ -199,7 +203,7 @@ mod native {
     use super::*;
     use std::fs;
     const RESOLV: &str = "/etc/resolv.conf";
-    pub(super) fn plan(address: IpAddr) -> io::Result<Vec<(String, String)>> {
+    pub(super) fn plan(address: IpAddr, _: u32) -> io::Result<Vec<(String, String)>> {
         Ok(vec![(
             {
                 use std::os::unix::fs::MetadataExt;

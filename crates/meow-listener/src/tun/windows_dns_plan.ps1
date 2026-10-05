@@ -1,5 +1,6 @@
 $adapters = @{}
 foreach ($adapter in @(Get-NetAdapter)) {
+    if ($adapter.InterfaceIndex -eq $excludedInterfaceIndex) { continue }
     $adapters[$adapter.InterfaceIndex.ToString()] = ([guid]$adapter.InterfaceGuid).ToString('D')
 }
 $families = @{2='IPv4'; 23='IPv6'}

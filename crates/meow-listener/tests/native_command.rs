@@ -37,6 +37,31 @@ fn native_child_fixture() {
             assert_eq!(output, "native command completed");
         }
         #[cfg(windows)]
+        Ok("dns-plan-excludes-owned-tun") => {
+            let fixture = include_str!("fixtures/windows_dns_commands.ps1");
+            let plan = include_str!("../src/tun/windows_dns_plan.ps1");
+            let output = meow_listener::tun::ownership::powershell(&format!(
+                "{fixture}\n$excludedInterfaceIndex = 2\n{plan}"
+            ))
+            .unwrap();
+            let resources: Vec<String> = serde_json::from_str(&output).unwrap();
+            assert_eq!(
+                resources,
+                [
+                    "11111111-1111-1111-1111-111111111111|IPv4",
+                    "11111111-1111-1111-1111-111111111111|IPv6",
+                ]
+            );
+            let lookup = include_str!("../src/tun/windows_dns_adapter.ps1");
+            let error = meow_listener::tun::ownership::powershell(&format!(
+                "{fixture}\n$guid = '33333333-3333-3333-3333-333333333333'\n{lookup}"
+            ))
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("restoration cannot be confirmed"));
+        }
+        #[cfg(windows)]
         Ok("dns-plan") => {
             let fixture = include_str!("fixtures/windows_dns_commands.ps1");
             let plan = include_str!("../src/tun/windows_dns_plan.ps1");
@@ -81,6 +106,22 @@ fn native_child_fixture() {
         }
         _ => {}
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_dns_plan_excludes_owned_tun_and_missing_external_adapter_still_fails() {
+    let output = owned_command_output(
+        &mut child("dns-plan-excludes-owned-tun"),
+        Duration::from_secs(30),
+    )
+    .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[cfg(windows)]
