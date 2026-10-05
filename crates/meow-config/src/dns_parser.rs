@@ -860,7 +860,7 @@ fn build_fallback_filter(
     let geoip_reader = if geoip {
         let mmdb_path =
             explicit_mmdb_path.map_or_else(crate::default_geoip_path, std::path::PathBuf::from);
-        match std::fs::read(&mmdb_path)
+        match meow_common::managed_files::read(&mmdb_path)
             .map_err(|e| format!("{e}"))
             .and_then(|b| maxminddb::Reader::from_source(b).map_err(|e| format!("{e}")))
         {

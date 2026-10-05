@@ -618,7 +618,7 @@ pub async fn load_config(path: &str) -> Result<Config, anyhow::Error> {
 /// document (the TUN global-route interface binding, issue #695) before
 /// the build's provider / geodata / ECH fetches open their first socket.
 pub async fn load_raw_config(path: &str) -> Result<raw::RawConfig, anyhow::Error> {
-    let bytes = tokio::fs::read(path)
+    let bytes = meow_common::managed_files::read_async(Path::new(path))
         .await
         .map_err(|e| anyhow::anyhow!("failed to read config file {path}: {e}"))?;
     // Strip an optional UTF-8 BOM, which YAML 1.2 permits but some
@@ -720,6 +720,9 @@ pub(crate) fn unique_scratch_path(path: &Path) -> PathBuf {
 /// land an older document's rename last (issue #543).
 pub fn save_raw_config(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
     let yaml = serde_yaml::to_string(raw)?;
+    if meow_common::managed_files::is_managed() {
+        return save_managed_config(path, yaml.as_bytes()).map_err(Into::into);
+    }
     // Scratch files orphaned by a crash between create and rename
     // accumulate forever otherwise — sweep stale ones on each save
     // (issue #621).
@@ -753,6 +756,12 @@ pub fn save_raw_config(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::E
 /// the `CONFIG_MUTATION` lane so file order follows commit order (issue #543).
 pub async fn save_raw_config_async(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
     let yaml = serde_yaml::to_string(raw)?;
+    if meow_common::managed_files::is_managed() {
+        let path = path.to_owned();
+        return tokio::task::spawn_blocking(move || save_managed_config(&path, yaml.as_bytes()))
+            .await?
+            .map_err(Into::into);
+    }
     // Same crash-leftover sweep as the sync variant (issue #621), off the
     // async worker since it walks the config dir.
     {
@@ -781,6 +790,20 @@ pub async fn save_raw_config_async(path: &str, raw: &raw::RawConfig) -> Result<(
     }
     info!("Config saved to {}", path);
     Ok(())
+}
+
+fn save_managed_config(path: &str, yaml: &[u8]) -> std::io::Result<()> {
+    match meow_common::managed_files::read(Path::new(path)) {
+        Ok(previous) => meow_common::managed_files::write_atomic_if_managed(
+            Path::new(&format!("{path}.bak")),
+            &previous,
+        )
+        .expect("The product home policy cannot be removed")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    meow_common::managed_files::write_atomic_if_managed(Path::new(path), yaml)
+        .expect("The product home policy cannot be removed")
 }
 
 #[cfg(test)]
@@ -2986,11 +3009,10 @@ fn build_parser_context_at(
             Some(Arc::new(meow_rules::country_index::CountryIndex::default()))
         }
         Some(trigger) => {
-            let reader = load_mmdb_mmap(geoip_path, "GeoIP", trigger)?;
+            let reader = load_mmdb(geoip_path, "GeoIP", trigger)?;
             let allowed = collect_geoip_countries(&lines);
             let index = meow_rules::country_index::CountryIndex::build(&reader, &allowed)
                 .map_err(|e| anyhow::anyhow!("failed to build GeoIP country index: {e}"))?;
-            // reader is mmap-backed — pages are returned to the OS on drop.
             drop(reader);
             Some(Arc::new(index))
         }
@@ -3003,7 +3025,7 @@ fn build_parser_context_at(
             Some(Arc::new(meow_rules::asn_index::AsnIndex::default()))
         }
         Some(trigger) => {
-            let reader = load_mmdb_mmap(asn_path, "GeoLite2-ASN", trigger)?;
+            let reader = load_mmdb(asn_path, "GeoLite2-ASN", trigger)?;
             let allowed = collect_asn_numbers(&lines);
             let index = meow_rules::asn_index::AsnIndex::build(&reader, &allowed)
                 .map_err(|e| anyhow::anyhow!("failed to build ASN index: {e}"))?;
@@ -3042,16 +3064,34 @@ fn build_parser_context_at(
     })
 }
 
-/// Memory-map an MMDB file. The OS reclaims pages immediately on drop,
-/// unlike `Vec<u8>` where the allocator retains the freed block.
-fn load_mmdb_mmap(
+enum MmdbSource {
+    Mapped(maxminddb::Mmap),
+    Managed(Vec<u8>),
+}
+
+impl AsRef<[u8]> for MmdbSource {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Mapped(source) => source,
+            Self::Managed(bytes) => bytes,
+        }
+    }
+}
+
+fn load_mmdb(
     path: &Path,
     kind: &str,
     trigger: &str,
-) -> Result<maxminddb::Reader<maxminddb::Mmap>, anyhow::Error> {
-    // Safety: the file is read-only and not modified during the reader's
-    // lifetime (dropped before the function returns to the caller).
-    let reader = unsafe { maxminddb::Reader::open_mmap(path) }.map_err(|e| {
+) -> Result<maxminddb::Reader<MmdbSource>, anyhow::Error> {
+    let source = if meow_common::managed_files::is_managed() {
+        // Caller-owned files can change concurrently; copying avoids mmap UB.
+        MmdbSource::Managed(meow_common::managed_files::read(path)?)
+    } else {
+        let file = meow_common::managed_files::open(path)?;
+        // CLI resources remain unchanged during this short-lived reader.
+        MmdbSource::Mapped(unsafe { maxminddb::Mmap::map(&file) }?)
+    };
+    let reader = maxminddb::Reader::from_source(source).map_err(|e| {
         anyhow::anyhow!(
             "Failed to load {} database at {}\n  required by rule: {}\n  underlying error: {}",
             kind,
@@ -3060,7 +3100,7 @@ fn load_mmdb_mmap(
             e
         )
     })?;
-    info!("Loaded {} database from {} (mmap)", kind, path.display());
+    info!("Loaded {} database from {}", kind, path.display());
     Ok(reader)
 }
 

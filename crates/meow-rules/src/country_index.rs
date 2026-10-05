@@ -234,7 +234,7 @@ mod tests {
         if !path.exists() {
             return None;
         }
-        let bytes = std::fs::read(&path).ok()?;
+        let bytes = meow_common::managed_files::read(&path).ok()?;
         maxminddb::Reader::from_source(bytes).ok()
     }
 

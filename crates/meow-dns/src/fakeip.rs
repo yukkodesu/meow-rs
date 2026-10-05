@@ -354,7 +354,7 @@ fn load_snapshot(path: &Path) -> PersistedSnapshot {
     if !path.exists() {
         return PersistedSnapshot::default();
     }
-    match fs::read(path) {
+    match meow_common::managed_files::read(path) {
         Ok(bytes) => serde_json::from_slice::<PersistedSnapshot>(&bytes).unwrap_or_else(|e| {
             warn!(
                 "fakeip: corrupt snapshot {} ({}); starting fresh",
@@ -375,6 +375,18 @@ fn load_snapshot(path: &Path) -> PersistedSnapshot {
 }
 
 fn persist_to_file(path: &Path, snap: &PersistedSnapshot) {
+    if meow_common::managed_files::is_managed() {
+        let result = serde_json::to_vec(snap)
+            .map_err(io::Error::other)
+            .and_then(|bytes| {
+                meow_common::managed_files::write_atomic_if_managed(path, &bytes)
+                    .expect("The product home policy cannot be removed")
+            });
+        if let Err(error) = result {
+            warn!("fakeip: persist {} failed: {error}", path.display());
+        }
+        return;
+    }
     // Unique scratch per call — the `Drop` flush can overlap the
     // background task's in-flight persist, and a shared tmp would let one
     // writer's rename publish the other's splice (issue #543 review).
