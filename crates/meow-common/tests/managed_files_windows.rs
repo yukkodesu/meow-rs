@@ -285,6 +285,8 @@ fn caller_operations_restore_preexisting_thread_identity_on_success_and_error() 
 fn caller_can_atomically_replace_nested_cache_and_edit_it_directly() {
     let dir = tempfile::tempdir().unwrap();
     let home = ManagedHome::open(dir.path(), &caller()).unwrap();
+    home.write_atomic(Path::new("x"), b"short name").unwrap();
+    assert_eq!(home.read(Path::new("x")).unwrap(), b"short name");
     home.write_atomic("providers/nodes.yaml".as_ref(), b"proxies: []")
         .unwrap();
     home.write_atomic("providers/nodes.yaml".as_ref(), b"proxies: [DIRECT]")
@@ -340,7 +342,20 @@ fn owner_equals_user(path: &Path, token: &OwnedHandle) -> bool {
             EqualSid, TokenUser, OWNER_SECURITY_INFORMATION, TOKEN_USER,
         },
     };
-    let file = std::fs::File::open(path).unwrap();
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let file = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            windows_sys::Win32::Storage::FileSystem::READ_CONTROL,
+            7,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(file, INVALID_HANDLE_VALUE);
+    let file = unsafe { OwnedHandle::from_raw_handle(file) };
     let mut owner = std::ptr::null_mut();
     let mut descriptor = std::ptr::null_mut();
     assert_eq!(
@@ -389,6 +404,7 @@ fn product_files_use_token_user_owner_and_restricted_caller_has_no_ambient_acces
         &dir.path().join("cache/fakeip.json"),
         &token
     ));
+    assert!(owner_equals_user(&dir.path().join("cache"), &token));
     let mut sid = vec![0u32; 32];
     let mut length = 128;
     assert_ne!(
@@ -515,6 +531,7 @@ fn elevated_exact_owner_is_accepted_but_ordinary_caller_rejects_admin_owned_home
         &dir.path().join("providers/nodes.yaml"),
         &token
     ));
+    assert!(owner_equals_user(&dir.path().join("providers"), &token));
     let disabled = SID_AND_ATTRIBUTES {
         Sid: admin.as_mut_ptr().cast(),
         Attributes: 0,

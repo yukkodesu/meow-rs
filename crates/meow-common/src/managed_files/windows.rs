@@ -466,7 +466,8 @@ impl Security {
 
 fn rename(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {
     let name: Vec<u16> = name.encode_wide().collect();
-    let length = std::mem::offset_of!(FILE_RENAME_INFO, FileName) + name.len() * 2;
+    let length = (std::mem::offset_of!(FILE_RENAME_INFO, FileName) + name.len() * 2)
+        .max(size_of::<FILE_RENAME_INFO>());
     let mut buffer = vec![0usize; length.div_ceil(size_of::<usize>())];
     let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
     unsafe {
