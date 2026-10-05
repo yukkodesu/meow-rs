@@ -368,12 +368,17 @@ impl Host {
         if state.closed {
             return Err(RpcError::new("closed", "The host session has closed"));
         }
-        let home = state.home.clone();
+        let home = state.home.clone().ok_or_else(|| {
+            RpcError::new(
+                "not_initialized",
+                "Initialize the product home before checking a profile",
+            )
+        })?;
         drop(state);
         let content = arguments
             .as_str()
             .ok_or_else(|| RpcError::new("invalid_arguments", "Expected a YAML string"))?;
-        let parsed = config::parse(content, home.as_deref());
+        let parsed = config::parse(content, Some(&home));
         let (raw, mut check) = match parsed {
             Ok((raw, check)) => (Some(raw), check),
             Err(error) => (
@@ -391,7 +396,7 @@ impl Host {
         };
         if let Some(raw) = raw.filter(|_| check.valid) {
             let result = tokio::task::spawn_blocking(move || {
-                meow_config::rebuild_from_raw_with_cache_dir(&raw, home.as_deref(), None)
+                meow_config::rebuild_from_raw_with_cache_dir(&raw, Some(&home), None)
             })
             .await
             .map_err(|e| RpcError::new("validation_failed", e.to_string()))?;

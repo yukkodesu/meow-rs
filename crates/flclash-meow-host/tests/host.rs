@@ -17,6 +17,16 @@ async fn call(host: &Host, method: &str, arguments: Value) -> Value {
 async fn initialization_is_idle_and_unknown_nested_options_are_reported() {
     let host = Host::new();
     let dir = tempfile::tempdir().unwrap();
+    for method in ["checkConfig", "validateConfig"] {
+        let response = host
+            .call(Request {
+                id: None,
+                method: method.into(),
+                arguments: json!("rules: ['MATCH,DIRECT']\n"),
+            })
+            .await;
+        assert_eq!(response.error.unwrap().code, "not_initialized");
+    }
     assert_eq!(
         call(&host, "getCoreInfo", Value::Null).await["protocolVersion"],
         1
