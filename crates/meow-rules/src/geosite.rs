@@ -290,7 +290,7 @@ impl GeositeDB {
         path: &Path,
         allowed: Option<&HashSet<String>>,
     ) -> Result<Self, GeositeError> {
-        let bytes = meow_common::managed_files::read(path.as_ref())?;
+        let bytes = meow_common::managed_files::read(path)?;
         Self::from_bytes(&bytes, allowed)
     }
 }
