@@ -11,6 +11,10 @@ type Peer = tokio::net::UnixStream;
 #[path = "support/native_traffic.rs"]
 mod traffic;
 
+#[cfg(target_os = "macos")]
+#[path = "support/macos_routes.rs"]
+mod macos_routes;
+
 struct Session {
     peer: Option<Peer>,
     child: Child,
@@ -185,17 +189,7 @@ fn snapshot() -> anyhow::Result<Value> {
             Duration::from_secs(20),
         )?;
         anyhow::ensure!(output.status.success(), "route snapshot failed");
-        let mut routes: Vec<String> = String::from_utf8(output.stdout)?
-            .lines()
-            .filter(|line| line.starts_with(|c: char| c.is_ascii_digit() || c == 'd'))
-            .map(|line| {
-                line.split_whitespace()
-                    .take(4)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .collect();
-        routes.sort();
+        let routes = macos_routes::persistent_routes(&String::from_utf8(output.stdout)?);
         Ok(json!({"dns":dns,"routes":routes}))
     }
 }
@@ -251,11 +245,18 @@ async fn exercise(
     session.start().await?;
     drop(session.peer.take());
     let exit = tokio::time::timeout(Duration::from_secs(45), session.child.wait()).await??;
+    let restored = snapshot()?;
+    evidence.push(json!({
+        "phase":"ipcEof",
+        "exitSuccess":exit.success(),
+        "exitStatus":exit.to_string(),
+        "restored":&restored,
+    }));
+    anyhow::ensure!(exit.success(), "IPC EOF host exited unsuccessfully: {exit}");
     anyhow::ensure!(
-        exit.success() && snapshot()? == before,
+        restored == before,
         "IPC EOF did not confirm native restoration"
     );
-    evidence.push(json!({"phase":"ipcEof","restored":snapshot()?}));
     *session = Session::spawn(home).await?;
     session.initialize(home).await?;
     session.start().await?;
