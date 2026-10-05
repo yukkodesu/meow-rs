@@ -17,11 +17,11 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     #[cfg(windows)]
-    let stream = connect(&address).await?;
+    let (stream, peer) = connect(&address).await?;
     #[cfg(unix)]
     let (stream, uid, gid) = connect(&address).await?;
     #[cfg(windows)]
-    let host = Arc::new(Host::new());
+    let host = Arc::new(Host::with_windows_peer(peer));
     #[cfg(unix)]
     let host = Arc::new(Host::with_peer_identity(uid, gid));
     let (filter, reload) =
@@ -52,7 +52,10 @@ async fn main() -> anyhow::Result<()> {
 #[cfg(windows)]
 async fn connect(
     address: &str,
-) -> anyhow::Result<tokio::net::windows::named_pipe::NamedPipeClient> {
+) -> anyhow::Result<(
+    tokio::net::windows::named_pipe::NamedPipeClient,
+    flclash_meow_host::peer::WindowsPeer,
+)> {
     anyhow::ensure!(
         address.starts_with(r"\\.\pipe\FlClashMeowCore_"),
         "Unexpected product IPC address"
@@ -60,7 +63,10 @@ async fn connect(
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         match tokio::net::windows::named_pipe::ClientOptions::new().open(address) {
-            Ok(stream) => return Ok(stream),
+            Ok(stream) => {
+                let peer = flclash_meow_host::peer::WindowsPeer::from_pipe_client(&stream)?;
+                return Ok((stream, peer));
+            }
             Err(error)
                 if tokio::time::Instant::now() < deadline
                     && (error.kind() == std::io::ErrorKind::NotFound

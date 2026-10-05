@@ -4,6 +4,8 @@ mod ipc;
 mod lifecycle_tests;
 pub mod native;
 mod operations;
+#[cfg(windows)]
+pub mod peer;
 pub mod protocol;
 mod runtime;
 pub use ipc::{serve, serve_until};
@@ -38,6 +40,8 @@ struct State {
 }
 
 pub struct Host {
+    #[cfg(windows)]
+    windows_peer: Option<peer::WindowsPeer>,
     #[cfg(unix)]
     peer_identity: Option<(u32, u32)>,
     state: Mutex<State>,
@@ -83,6 +87,8 @@ impl Host {
             }
         });
         Self {
+            #[cfg(windows)]
+            windows_peer: None,
             #[cfg(unix)]
             peer_identity: None,
             state: Mutex::new(State::default()),
@@ -105,6 +111,12 @@ impl Host {
     pub fn with_peer_identity(uid: u32, gid: u32) -> Self {
         let mut host = Self::new();
         host.peer_identity = Some((uid, gid));
+        host
+    }
+    #[cfg(windows)]
+    pub fn with_windows_peer(peer: peer::WindowsPeer) -> Self {
+        let mut host = Self::new();
+        host.windows_peer = Some(peer);
         host
     }
     pub fn subscribe_events(&self) -> broadcast::Receiver<Value> {
@@ -139,6 +151,13 @@ impl Host {
     }
 
     async fn dispatch(&self, method: &str, arguments: Value) -> Result<Value, RpcError> {
+        #[cfg(windows)]
+        if !matches!(method, "shutdown" | "stopListener") {
+            if let Some(peer) = self.windows_peer.as_ref() {
+                peer.ensure_alive()
+                    .map_err(|error| RpcError::new("peer_disconnected", error.to_string()))?;
+            }
+        }
         if matches!(method, "checkConfig" | "validateConfig") {
             return self.check(method, &arguments).await;
         }
@@ -563,6 +582,16 @@ impl Host {
     }
 
     async fn initialize_home(&self, path: PathBuf) -> Result<PathBuf, RpcError> {
+        #[cfg(windows)]
+        if let Some(peer) = self.windows_peer.as_ref() {
+            let caller = peer.caller.clone();
+            return tokio::task::spawn_blocking(move || {
+                meow_common::managed_files::authorize_home_windows(&path, &caller)
+            })
+            .await
+            .map_err(|error| RpcError::new("initialization_failed", error.to_string()))?
+            .map_err(|error| RpcError::new("invalid_home_owner", error.to_string()));
+        }
         #[cfg(unix)]
         if let Some((uid, gid)) = self.peer_identity {
             return tokio::task::spawn_blocking(move || {

@@ -91,8 +91,14 @@ async fn endpoints_configuration_logs_and_traffic() {
     .unwrap();
     #[cfg(unix)]
     let custom_ui = unsafe { libc::geteuid() } != 0;
-    #[cfg(not(unix))]
-    let custom_ui = true;
+    #[cfg(windows)]
+    let custom_ui = {
+        #[link(name = "shell32")]
+        unsafe extern "system" {
+            fn IsUserAnAdmin() -> i32;
+        }
+        unsafe { IsUserAnAdmin() == 0 }
+    };
     let mut profile = "listeners:\n  - name: local\n    type: mixed\n    listen: 127.0.0.1\n    port: 0\nexternal-controller: 127.0.0.1:0\nexternal-ui: dashboard\nmode: rule\nlog-level: debug\nrules: ['MATCH,REJECT']\nhosts: { test.example: 127.0.0.42 }\ndns:\n  enable: true\n  listen: 127.0.0.1:0\n".to_string();
     if !custom_ui {
         let check = call(&host, "checkConfig", json!(profile)).await;

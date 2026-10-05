@@ -126,7 +126,7 @@ fn product_recovery_path() -> io::Result<PathBuf> {
     }
 }
 
-fn privileged() -> bool {
+pub(crate) fn privileged() -> bool {
     #[cfg(unix)]
     {
         unsafe { libc::geteuid() == 0 }

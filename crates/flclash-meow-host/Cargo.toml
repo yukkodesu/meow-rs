@@ -33,6 +33,9 @@ uuid.workspace = true
 percent-encoding = "2"
 libc = "0.2"
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security", "Win32_System_Pipes", "Win32_System_Threading"] }
+
 [dev-dependencies]
 tempfile.workspace = true
 
