@@ -31,7 +31,11 @@ pub struct RpcError {
 
 impl RpcError {
     pub fn new(code: &str, message: impl Into<String>) -> Self {
-        Self { code: code.into(), message: message.into(), details: Value::Null }
+        Self {
+            code: code.into(),
+            message: message.into(),
+            details: Value::Null,
+        }
     }
 }
 
@@ -43,7 +47,10 @@ pub async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<Opt
     reader.read_exact(&mut header[1..]).await?;
     let length = u32::from_le_bytes(header) as usize;
     if length == 0 || length > MAX_FRAME_SIZE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid IPC frame size"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid IPC frame size",
+        ));
     }
     let mut frame = vec![0; length];
     reader.read_exact(&mut frame).await?;
@@ -52,9 +59,14 @@ pub async fn read_frame(reader: &mut (impl AsyncRead + Unpin)) -> io::Result<Opt
 
 pub async fn write_frame(writer: &mut (impl AsyncWrite + Unpin), frame: &[u8]) -> io::Result<()> {
     if frame.is_empty() || frame.len() > MAX_FRAME_SIZE {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid IPC frame size"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid IPC frame size",
+        ));
     }
-    writer.write_all(&(frame.len() as u32).to_le_bytes()).await?;
+    writer
+        .write_all(&(frame.len() as u32).to_le_bytes())
+        .await?;
     writer.write_all(frame).await?;
     writer.flush().await
 }
