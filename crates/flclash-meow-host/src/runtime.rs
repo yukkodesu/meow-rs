@@ -86,12 +86,18 @@ impl Runtime {
 
     pub fn running(&self) -> bool {
         self.running
-            && self.failure.read().is_none()
+            && self.failure().is_none()
             && (!self.config.tun.enable || self.state.tunnel.has_tun())
     }
 
     pub fn failure(&self) -> Option<String> {
-        self.failure.read().clone()
+        self.failure.read().clone().or_else(|| {
+            self.state
+                .tunnel
+                .tun_cleanup_result()
+                .err()
+                .map(|error| format!("resources_release_unconfirmed: {error}"))
+        })
     }
 
     pub async fn start(
@@ -203,8 +209,10 @@ impl Runtime {
             if let Some(binding) = binding.into_binding() {
                 listener = listener.with_outbound_binding(binding);
             }
+            let failure = Arc::clone(&self.failure);
             self.pending_tun = Some(tokio::spawn(async move {
                 if let Err(e) = listener.run().await {
+                    *failure.write() = Some(format!("TUN failed: {e}"));
                     tracing::error!("TUN failed: {e}");
                 }
             }));

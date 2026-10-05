@@ -46,6 +46,12 @@ async fn cleanup_failure_retains_the_session_and_prevents_runtime_replacement() 
             .tunnel
             .report_tun_cleanup_failure("fixture route restoration failure".into());
     }
+    let failed = call(&host, "getRuntimeState", Value::Null).await.result;
+    assert_eq!(failed["running"], false);
+    assert!(failed["failure"]
+        .as_str()
+        .unwrap()
+        .contains("fixture route restoration failure"));
     let replacement = call(&host, "setupConfig", Value::Null).await;
     assert_eq!(
         replacement.error.unwrap().code,
