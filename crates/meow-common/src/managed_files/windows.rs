@@ -12,24 +12,31 @@ use std::{
 };
 
 use windows_sys::{
-    Wdk::Storage::FileSystem::{FileRenameInformation, NtSetInformationFile},
+    Wdk::{
+        Foundation::OBJECT_ATTRIBUTES,
+        Storage::FileSystem::{
+            FileRenameInformation, NtCreateFile, NtSetInformationFile, FILE_CREATE,
+            FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN, FILE_OPEN_IF,
+            FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT,
+        },
+    },
     Win32::{
         Foundation::{
-            LocalFree, RtlNtStatusToDosError, ERROR_ALREADY_EXISTS, GENERIC_READ, GENERIC_WRITE,
-            INVALID_HANDLE_VALUE,
+            LocalFree, RtlNtStatusToDosError, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE,
+            OBJ_CASE_INSENSITIVE, OBJ_DONT_REPARSE, UNICODE_STRING,
         },
         Security::{
             Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
             InitializeSecurityDescriptor, SetSecurityDescriptorOwner, OWNER_SECURITY_INFORMATION,
-            SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+            SECURITY_DESCRIPTOR,
         },
         Storage::FileSystem::{
-            CreateDirectoryW, CreateFileW, FileDispositionInfo, GetFileInformationByHandle,
-            GetFileType, GetFinalPathNameByHandleW, SetFileInformationByHandle,
-            BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE, FILE_ATTRIBUTE_DIRECTORY,
-            FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_READ,
-            FILE_TYPE_DISK, OPEN_EXISTING, READ_CONTROL,
+            CreateFileW, FileDispositionInfo, GetFileInformationByHandle, GetFileType,
+            GetFinalPathNameByHandleW, SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            DELETE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_LIST_DIRECTORY,
+            FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FILE_TYPE_DISK, OPEN_EXISTING, READ_CONTROL, SYNCHRONIZE,
         },
         System::{SystemServices::SECURITY_DESCRIPTOR_REVISION, IO::IO_STATUS_BLOCK},
     },
@@ -95,12 +102,26 @@ impl ManagedHome {
                 return Err(denied("The product home contains traversal components"));
             };
             require_name(name)?;
+            let parent = roots.last().expect("A drive directory is always open");
+            let directory = open_at(
+                parent,
+                name,
+                READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+                true,
+                FILE_OPEN,
+                None,
+            )?;
+            require_directory(&directory)?;
             current.push(name);
-            roots.push(open_directory(&current)?);
+            roots.push(directory);
         }
         let root = roots.last().expect("A drive directory is always open");
         require_owner(root, caller)?;
         let path = final_path(root)?;
+        if !matches!(path.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_)))
+        {
+            return Err(denied("The product home must reside on a local drive"));
+        }
         Ok(Self {
             path,
             requested_path: current,
@@ -124,12 +145,15 @@ impl ManagedHome {
 
     pub fn open_file(&self, path: &Path) -> io::Result<File> {
         let _authority = self.caller.enter()?;
-        let (parent, name, _locks) = self.parent(path, false)?;
-        let file = create_file(
-            &parent.join(name),
+        let (name, locks) = self.parent(path, false)?;
+        let parent = locks.last().unwrap_or_else(|| self.root());
+        let file = open_at(
+            parent,
+            &name,
             GENERIC_READ | READ_CONTROL,
-            OPEN_EXISTING,
-            ptr::null(),
+            false,
+            FILE_OPEN,
+            None,
         )?;
         require_file(&file, &self.caller)?;
         Ok(file)
@@ -141,12 +165,15 @@ impl ManagedHome {
             .directories
             .lock()
             .map_err(|_| io::Error::other("Managed directory lock poisoned"))?;
-        let (parent, name, locks) = self.parent(path, true)?;
-        match create_file(
-            &parent.join(&name),
+        let (name, locks) = self.parent(path, true)?;
+        let parent = locks.last().unwrap_or_else(|| self.root());
+        match open_at(
+            parent,
+            &name,
             GENERIC_READ | READ_CONTROL,
-            OPEN_EXISTING,
-            ptr::null(),
+            false,
+            FILE_OPEN,
+            None,
         ) {
             Ok(file) => require_file(&file, &self.caller)?,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -157,12 +184,13 @@ impl ManagedHome {
             std::process::id(),
             SCRATCH.fetch_add(1, Ordering::Relaxed)
         );
-        let mut security = Security::new(&self.caller)?;
-        let file = create_file(
-            &parent.join(temporary),
+        let file = open_at(
+            parent,
+            OsStr::new(&temporary),
             GENERIC_WRITE | GENERIC_READ | READ_CONTROL | DELETE,
-            CREATE_NEW,
-            security.attributes(),
+            false,
+            FILE_CREATE,
+            Some(&self.caller),
         )?;
         let mut scratch = Scratch(Some(file));
         let file = scratch
@@ -178,7 +206,7 @@ impl ManagedHome {
         Ok(())
     }
 
-    fn parent(&self, path: &Path, create: bool) -> io::Result<(PathBuf, OsString, Vec<File>)> {
+    fn parent(&self, path: &Path, create: bool) -> io::Result<(OsString, Vec<File>)> {
         let relative = if path.is_absolute() {
             path.strip_prefix(&self.path)
                 .or_else(|_| path.strip_prefix(&self.requested_path))
@@ -199,27 +227,22 @@ impl ManagedHome {
         let name = names
             .pop()
             .ok_or_else(|| denied("A managed file name is required"))?;
-        let mut parent = self.path.clone();
         let mut locks = Vec::new();
         for name in names {
-            parent.push(name);
-            if create {
-                let mut security = Security::new(&self.caller)?;
-                if unsafe {
-                    CreateDirectoryW(wide(parent.as_os_str()).as_ptr(), security.attributes())
-                } == 0
-                {
-                    let error = io::Error::last_os_error();
-                    if error.raw_os_error() != Some(ERROR_ALREADY_EXISTS as i32) {
-                        return Err(error);
-                    }
-                }
-            }
-            let directory = open_directory(&parent)?;
+            let parent = locks.last().unwrap_or_else(|| self.root());
+            let directory = open_at(
+                parent,
+                &name,
+                READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+                true,
+                if create { FILE_OPEN_IF } else { FILE_OPEN },
+                create.then_some(&self.caller),
+            )?;
+            require_directory(&directory)?;
             require_owner(&directory, &self.caller)?;
             locks.push(directory);
         }
-        Ok((parent, name, locks))
+        Ok((name, locks))
     }
 }
 
@@ -246,19 +269,14 @@ fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(Some(0)).collect()
 }
 
-fn create_file(
-    path: &Path,
-    access: u32,
-    disposition: u32,
-    security: *const SECURITY_ATTRIBUTES,
-) -> io::Result<File> {
+fn open_directory(path: &Path) -> io::Result<File> {
     let handle = unsafe {
         CreateFileW(
             wide(path.as_os_str()).as_ptr(),
-            access,
-            FILE_SHARE_READ,
-            security,
-            disposition,
+            READ_CONTROL | FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ptr::null(),
+            OPEN_EXISTING,
             FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
             ptr::null_mut(),
         )
@@ -266,7 +284,72 @@ fn create_file(
     if handle == INVALID_HANDLE_VALUE {
         Err(io::Error::last_os_error())
     } else {
-        Ok(unsafe { File::from_raw_handle(handle) })
+        let directory = unsafe { File::from_raw_handle(handle) };
+        require_directory(&directory)?;
+        Ok(directory)
+    }
+}
+
+fn open_at(
+    parent: &File,
+    name: &OsStr,
+    access: u32,
+    directory: bool,
+    disposition: u32,
+    caller: Option<&WindowsCaller>,
+) -> io::Result<File> {
+    let mut name: Vec<u16> = name.encode_wide().collect();
+    let length = u16::try_from(name.len() * 2).map_err(|_| denied("Managed name is too long"))?;
+    let mut name = UNICODE_STRING {
+        Length: length,
+        MaximumLength: length,
+        Buffer: name.as_mut_ptr(),
+    };
+    let security = caller.map(Security::new).transpose()?;
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: raw(parent),
+        ObjectName: &mut name,
+        Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        SecurityDescriptor: security.as_ref().map_or(ptr::null_mut(), |s| {
+            (&*s.0 as *const SECURITY_DESCRIPTOR).cast_mut().cast()
+        }),
+        SecurityQualityOfService: ptr::null_mut(),
+    };
+    let mut handle = ptr::null_mut();
+    let mut status = IO_STATUS_BLOCK::default();
+    let result = unsafe {
+        NtCreateFile(
+            &mut handle,
+            access | SYNCHRONIZE,
+            &attributes,
+            &mut status,
+            ptr::null(),
+            0,
+            FILE_SHARE_READ | if directory { FILE_SHARE_WRITE } else { 0 },
+            disposition,
+            FILE_OPEN_REPARSE_POINT
+                | FILE_SYNCHRONOUS_IO_NONALERT
+                | if directory {
+                    FILE_DIRECTORY_FILE
+                } else {
+                    FILE_NON_DIRECTORY_FILE
+                },
+            ptr::null(),
+            0,
+        )
+    };
+    nt_result(result)?;
+    Ok(unsafe { File::from_raw_handle(handle) })
+}
+
+fn nt_result(status: i32) -> io::Result<()> {
+    if status < 0 {
+        Err(io::Error::from_raw_os_error(
+            unsafe { RtlNtStatusToDosError(status) } as i32,
+        ))
+    } else {
+        Ok(())
     }
 }
 
@@ -292,17 +375,11 @@ fn identity(file: &File) -> io::Result<(u32, u32, u32)> {
     ))
 }
 
-fn open_directory(path: &Path) -> io::Result<File> {
-    let directory = create_file(
-        path,
-        READ_CONTROL | FILE_READ_ATTRIBUTES,
-        OPEN_EXISTING,
-        ptr::null(),
-    )?;
-    if information(&directory)?.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
+fn require_directory(directory: &File) -> io::Result<()> {
+    if information(directory)?.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
         return Err(denied("Managed parents must be ordinary directories"));
     }
-    Ok(directory)
+    Ok(())
 }
 
 fn require_file(file: &File, caller: &WindowsCaller) -> io::Result<()> {
@@ -365,10 +442,7 @@ fn final_path(file: &File) -> io::Result<PathBuf> {
     }
 }
 
-struct Security {
-    descriptor: Box<SECURITY_DESCRIPTOR>,
-    attributes: SECURITY_ATTRIBUTES,
-}
+struct Security(Box<SECURITY_DESCRIPTOR>);
 
 impl Security {
     fn new(caller: &WindowsCaller) -> io::Result<Self> {
@@ -386,20 +460,7 @@ impl Security {
                 0,
             )
         })?;
-        let attributes = SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: (&mut *descriptor as *mut SECURITY_DESCRIPTOR).cast(),
-            bInheritHandle: 0,
-        };
-        Ok(Self {
-            descriptor,
-            attributes,
-        })
-    }
-
-    fn attributes(&mut self) -> *const SECURITY_ATTRIBUTES {
-        let _retain = &self.descriptor;
-        &self.attributes
+        Ok(Self(descriptor))
     }
 }
 
@@ -422,13 +483,7 @@ fn rename(file: &File, directory: &File, name: &OsStr) -> io::Result<()> {
             length as u32,
             FileRenameInformation,
         );
-        if result < 0 {
-            Err(io::Error::from_raw_os_error(
-                RtlNtStatusToDosError(result) as i32
-            ))
-        } else {
-            Ok(())
-        }
+        nt_result(result)
     }
 }
 
