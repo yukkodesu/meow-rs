@@ -729,6 +729,7 @@ impl TunListener {
                 Some(gateway) => {
                     let g = Some(dns::DnsGuard::setup(
                         gateway,
+                        if_index,
                         self.recovery_directory
                             .as_ref()
                             .map(|directory| directory.join("dns.json")),
