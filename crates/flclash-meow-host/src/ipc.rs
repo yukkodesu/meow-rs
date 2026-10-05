@@ -52,19 +52,16 @@ where
                         continue;
                     }
                 };
-                let permit=match Arc::clone(&capacity).try_acquire_owned() {
-                    Ok(permit)=>permit,
-                    Err(_)=>{
+                let Ok(permit)=Arc::clone(&capacity).try_acquire_owned() else {
                         let response=Response{id:request.id,result:Value::Null,error:Some(RpcError::new("busy","Too many pending RPC requests"))};
                         if outgoing.send((serde_json::to_value(response).map_err(io::Error::other)?,None)).await.is_err() {break Err(io::Error::new(io::ErrorKind::BrokenPipe,"IPC writer exited"));}
                         continue;
-                    }
                 };
                 let host=Arc::clone(&host);let outgoing=outgoing.clone();let closed=closed.clone();
                 requests.spawn(async move {
                     let shutdown=request.method=="shutdown";
                     let response=host.call(request).await;
-                    if shutdown {
+                    if shutdown && response.error.is_none() {
                         let(ack,received)=oneshot::channel();
                         if let Ok(value)=serde_json::to_value(response) {let _=outgoing.send((value,Some(ack))).await;}
                         let _=received.await;let _=closed.send(()).await;

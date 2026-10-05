@@ -33,5 +33,8 @@ percent-encoding = "2"
 [dev-dependencies]
 tempfile.workspace = true
 
+[build-dependencies]
+toml = "0.8"
+
 [lints]
 workspace = true

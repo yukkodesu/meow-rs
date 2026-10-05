@@ -25,10 +25,15 @@ pub struct Runtime {
     tasks: JoinSet<()>,
     running: bool,
     failure: Arc<RwLock<Option<String>>>,
+    binding: Option<meow_api::PreinstalledBinding>,
 }
 
 impl Runtime {
-    pub fn prepare(mut config: Config, log_tx: broadcast::Sender<LogMessage>) -> Self {
+    pub fn prepare(
+        mut config: Config,
+        log_tx: broadcast::Sender<LogMessage>,
+        binding: Option<meow_api::PreinstalledBinding>,
+    ) -> Self {
         let tunnel = Tunnel::new_with_slot(Arc::clone(&config.dns.resolver_slot));
         tunnel.set_dialer_registry(config.provider_dialer_registry.clone());
         tunnel.set_mode(config.general.mode);
@@ -65,6 +70,7 @@ impl Runtime {
             tasks: JoinSet::new(),
             running: false,
             failure: Arc::new(RwLock::new(None)),
+            binding,
         }
     }
 
@@ -137,7 +143,10 @@ impl Runtime {
             ));
         }
         if self.config.tun.enable {
-            let binding = meow_api::preinstall_global_route_binding(&self.config.raw);
+            let binding = self
+                .binding
+                .take()
+                .unwrap_or_else(|| meow_api::preinstall_global_route_binding(&self.config.raw));
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
             let mut listener = meow_listener::TunListener::new(
                 self.state.tunnel.clone(),

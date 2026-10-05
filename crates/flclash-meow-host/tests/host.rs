@@ -40,6 +40,14 @@ async fn initialization_is_idle_and_unknown_nested_options_are_reported() {
         .unwrap()
         .iter()
         .any(|d| d["path"] == "proxies[0].reality-opts.imaginary"));
+    let malformed = call(&host, "checkConfig", json!("proxies: [")).await;
+    assert_eq!(malformed["valid"], false);
+    assert_eq!(malformed["diagnostics"][0]["path"], "$");
+    assert!(!call(&host, "validateConfig", json!("proxies: ["))
+        .await
+        .as_str()
+        .unwrap()
+        .is_empty());
     host.shutdown().await;
 }
 
@@ -180,4 +188,110 @@ async fn provider_nodes_with_unknown_options_cannot_silently_enter_a_group() {
         false
     );
     host.shutdown().await;
+}
+
+#[tokio::test]
+async fn provider_members_can_be_selected_probed_and_refreshed_without_losing_valid_data() {
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    let service = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", service.local_addr().unwrap());
+    let address = service.local_addr().unwrap();
+    let task = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = service.accept().await.unwrap();
+            tokio::spawn(async move {
+                let mut buf = [0; 1024];
+                let _ = stream.read(&mut buf).await;
+                stream
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .unwrap();
+                let _ = stream.read(&mut buf).await;
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+            });
+        }
+    });
+    let host = Host::new();
+    let dir = tempfile::tempdir().unwrap();
+    call(
+        &host,
+        "initClash",
+        json!({"home-dir":dir.path(),"version":1}),
+    )
+    .await;
+    let nodes = dir.path().join("nodes.yaml");
+    let node = |name: &str| {
+        format!(
+            "  - name: {name}\n    type: http\n    server: 127.0.0.1\n    port: {}\n",
+            address.port()
+        )
+    };
+    tokio::fs::write(
+        &nodes,
+        format!("proxies:\n{}{}", node("first"), node("second")),
+    )
+    .await
+    .unwrap();
+    tokio::fs::write(dir.path().join("config.yaml"),"proxy-providers:\n  local:\n    type: file\n    path: nodes.yaml\nproxy-groups:\n  - name: route\n    type: select\n    use: [local]\nrules: ['MATCH,route']\n").await.unwrap();
+    call(
+        &host,
+        "setupConfig",
+        json!({"selected-map":{},"test-url":url}),
+    )
+    .await;
+    call(
+        &host,
+        "changeProxy",
+        json!({"group-name":"route","proxy-name":"second"}),
+    )
+    .await;
+    let proxies = call(&host, "getProxies", Value::Null).await;
+    assert_eq!(proxies["proxies"]["route"]["now"], "second");
+    assert_eq!(proxies["proxies"]["first"]["type"], "Http");
+    let delay = call(
+        &host,
+        "asyncTestDelay",
+        json!({"proxy-name":"first","test-url":url,"timeout":1000}),
+    )
+    .await;
+    assert_eq!(delay["url"], url);
+    assert!(delay["value"].as_u64().unwrap() > 0);
+    let provider = call(&host, "getExternalProvider", json!("local")).await;
+    assert_eq!(provider["count"], 2);
+    assert_eq!(provider["vehicle-type"], "File");
+    assert!(provider["update-at"].is_string());
+    tokio::fs::write(
+        &nodes,
+        "proxies:\n  - name: wrong\n    type: direct\n    impossible-routing-option: true\n",
+    )
+    .await
+    .unwrap();
+    let failed = host
+        .call(Request {
+            id: Some("refresh".into()),
+            method: "updateExternalProvider".into(),
+            arguments: json!("local"),
+        })
+        .await;
+    assert!(failed.error.is_some());
+    assert_eq!(
+        call(&host, "getExternalProvider", json!("local")).await["count"],
+        2
+    );
+    tokio::fs::write(&nodes, format!("proxies:\n{}", node("third")))
+        .await
+        .unwrap();
+    call(&host, "updateExternalProvider", json!("local")).await;
+    assert_eq!(
+        call(&host, "getProxies", Value::Null).await["proxies"]["route"]["all"],
+        json!(["third"])
+    );
+    host.shutdown().await;
+    task.abort();
 }

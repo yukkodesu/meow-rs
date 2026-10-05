@@ -23,6 +23,7 @@ use tokio::sync::{broadcast, watch, Mutex, Semaphore};
 struct State {
     home: Option<PathBuf>,
     runtime: Option<Runtime>,
+    document: Option<Value>,
     closed: bool,
     generation: u64,
     traffic_baseline: (i64, i64),
@@ -145,7 +146,7 @@ impl Host {
         }
         match method {
             "getCoreInfo" => Ok(
-                json!({"name":"meow-rs","version":"0.22.0","hostVersion":env!("CARGO_PKG_VERSION"),"commit":env!("MEOW_HOST_COMMIT"),"protocolVersion":1,"capabilities":["config-check","proxy-groups","delay","providers","connections","traffic","logs","dns-cache","tun-fake-ip","tun-global-experimental","external-controller"],"statisticsScope":"all","connectionsScope":"tcp","tunModes":["fake-ip","global-experimental"]}),
+                json!({"name":"meow-rs","version":env!("MEOW_CORE_VERSION"),"hostVersion":env!("CARGO_PKG_VERSION"),"commit":env!("MEOW_HOST_COMMIT"),"protocolVersion":1,"capabilities":["config-check","proxy-groups","delay","providers","connections","traffic","logs","dns-cache","tun-fake-ip","tun-global-experimental","external-controller"],"statisticsScope":"all","connectionsScope":"tcp","tunModes":["fake-ip","global-experimental"]}),
             ),
             "getRuntimeState" => Ok(
                 json!({"initialized":state.home.is_some(),"configured":state.runtime.is_some(),"running":state.runtime.as_ref().is_some_and(Runtime::running),"tunActive":state.runtime.as_ref().is_some_and(|r|r.state.tunnel.has_tun()),"generation":state.generation,"failure":state.runtime.as_ref().and_then(Runtime::failure)}),
@@ -193,8 +194,9 @@ impl Host {
                     .runtime
                     .as_ref()
                     .ok_or_else(|| RpcError::new("not_configured", "No profile is configured"))?;
-                let mut document = serde_json::to_value(&*runtime.state.raw_config.read())
-                    .map_err(|e| RpcError::new("invalid_config", e.to_string()))?;
+                let mut document = state.document.clone().ok_or_else(|| {
+                    RpcError::new("not_configured", "No applied configuration document")
+                })?;
                 let updates = arguments.as_object().ok_or_else(|| {
                     RpcError::new("invalid_arguments", "Expected configuration fields")
                 })?;
@@ -203,8 +205,12 @@ impl Host {
                     .all(|k| matches!(k.as_str(), "mode" | "log-level"))
                 {
                     let router = runtime.router.clone();
-                    drop(state);
-                    Runtime::request(router, "PATCH", "/configs".into(), arguments).await?;
+                    Runtime::request(router, "PATCH", "/configs".into(), arguments.clone()).await?;
+                    if let Some(document) = state.document.as_mut() {
+                        for (key, value) in updates {
+                            document[key] = value.clone();
+                        }
+                    }
                 } else {
                     for (key, value) in updates {
                         document[key] = value.clone();
@@ -315,8 +321,23 @@ impl Host {
         let content = arguments
             .as_str()
             .ok_or_else(|| RpcError::new("invalid_arguments", "Expected a YAML string"))?;
-        let (raw, mut check) = config::parse(content, home.as_deref())?;
-        if check.valid {
+        let parsed = config::parse(content, home.as_deref());
+        let (raw, mut check) = match parsed {
+            Ok((raw, check)) => (Some(raw), check),
+            Err(error) => (
+                None,
+                config::CheckResult {
+                    valid: false,
+                    diagnostics: vec![config::Diagnostic {
+                        severity: "error",
+                        path: "$".into(),
+                        reason: error.message,
+                        suggestion: "Correct the YAML syntax and configuration value types.",
+                    }],
+                },
+            ),
+        };
+        if let Some(raw) = raw.filter(|_| check.valid) {
             let result = tokio::task::spawn_blocking(move || {
                 meow_config::rebuild_from_raw_with_cache_dir(&raw, home.as_deref(), None)
             })
@@ -355,11 +376,14 @@ impl Host {
             .as_ref()
             .ok_or_else(|| RpcError::new("not_initialized", "Host is not initialized"))?;
         let (raw, check) = config::parse(content, Some(home))?;
-        ensure_valid(check)?;
-        let config = meow_config::build_config(raw, Some(home))
-            .await
-            .map_err(|e| RpcError::new("invalid_config", e.to_string()))?;
-        let mut candidate = Runtime::prepare(config, self.log_tx.clone());
+        ensure_valid(&check)?;
+        let binding = meow_api::preinstall_global_route_binding(&raw);
+        let mut generation = self.generation.subscribe();
+        let config = tokio::select! {
+            config=meow_config::build_config(raw,Some(home))=>config.map_err(|e|RpcError::new("invalid_config",e.to_string()))?,
+            _=generation.changed()=>return Err(RpcError::new("request_superseded","A later runtime intent superseded configuration preparation")),
+        };
+        let mut candidate = Runtime::prepare(config, self.log_tx.clone(), Some(binding));
         if let Some(selections) = selections.get("selected-map").and_then(Value::as_object) {
             for (group, node) in selections {
                 if let (Some(proxy), Some(node)) =
@@ -399,22 +423,26 @@ impl Host {
             candidate.stop().await;
         }
         state.runtime = Some(candidate);
+        state.document = Some(
+            serde_yaml::from_str(content)
+                .map_err(|e| RpcError::new("invalid_config", e.to_string()))?,
+        );
         state.generation += 1;
         state.traffic_baseline = (0, 0);
         self.generation.send_modify(|g| *g += 1);
-        self.emit("loaded", json!(""));
+        self.emit("loaded", &json!(""));
         Ok(())
     }
 
-    fn emit(&self, kind: &str, data: Value) {
+    fn emit(&self, kind: &str, data: &Value) {
         let _ = self.events.send(json!({"type":kind,"data":data}));
     }
-    fn emit_bulk(&self, kind: &str, data: Value) {
+    fn emit_bulk(&self, kind: &str, data: &Value) {
         let _ = self.bulk.send(json!({"type":kind,"data":data}));
     }
     pub fn forward_log(&self, log: &LogMessage) {
         if self.log_subscribed.load(Ordering::Acquire) {
-            self.emit_bulk("log", log_value(log));
+            self.emit_bulk("log", &log_value(log));
         }
     }
     async fn shutdown_locked(&self, state: &mut State) {
@@ -441,7 +469,7 @@ fn string_field<'a>(arguments: &'a Value, key: &str) -> Result<&'a str, RpcError
 fn encode(value: &str) -> String {
     percent_encoding::utf8_percent_encode(value, percent_encoding::NON_ALPHANUMERIC).to_string()
 }
-fn ensure_valid(check: config::CheckResult) -> Result<(), RpcError> {
+fn ensure_valid(check: &config::CheckResult) -> Result<(), RpcError> {
     if check.valid {
         Ok(())
     } else {

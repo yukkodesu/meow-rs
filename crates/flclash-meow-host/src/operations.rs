@@ -52,13 +52,28 @@ impl Host {
                     .and_then(Value::as_u64)
                     .unwrap_or(5000)
                     .clamp(1, 30000);
+                let path = if app.tunnel.proxy(proxy).is_some() {
+                    format!("/proxies/{}/delay", encode(proxy))
+                } else {
+                    let mut providers: Vec<_> = app
+                        .proxy_providers
+                        .iter()
+                        .filter(|provider| provider.proxies().iter().any(|p| p.name() == proxy))
+                        .map(|provider| provider.key().clone())
+                        .collect();
+                    providers.sort();
+                    let provider = providers.first().ok_or_else(|| {
+                        RpcError::new("not_found", format!("Proxy {proxy} does not exist"))
+                    })?;
+                    format!(
+                        "/providers/proxies/{}/{}/healthcheck",
+                        encode(provider),
+                        encode(proxy)
+                    )
+                };
                 (
                     "GET",
-                    format!(
-                        "/proxies/{}/delay?url={}&timeout={timeout}",
-                        encode(proxy),
-                        encode(url)
-                    ),
+                    format!("{path}?url={}&timeout={timeout}", encode(url)),
                     Value::Null,
                 )
             }
@@ -102,8 +117,33 @@ impl Host {
         };
         let mut result = tokio::select! {result=Runtime::request(router.clone(),http,path,body)=>result?,_=generation.changed()=>return Err(RpcError::new("request_cancelled","The runtime changed while this operation was pending"))};
         drop(probe_permit);
+        if generation.has_changed().unwrap_or(true) {
+            return Err(RpcError::new(
+                "request_cancelled",
+                "The runtime changed while this operation was pending",
+            ));
+        }
         match method {
             "getProxies" => {
+                let providers = Runtime::request(
+                    router.clone(),
+                    "GET",
+                    "/providers/proxies".into(),
+                    Value::Null,
+                )
+                .await?;
+                if let Some(providers) = providers["providers"].as_object() {
+                    let proxies = result["proxies"]
+                        .as_object_mut()
+                        .ok_or_else(|| RpcError::new("invalid_response", "Missing proxy map"))?;
+                    for provider in providers.values() {
+                        for node in provider["proxies"].as_array().into_iter().flatten() {
+                            if let Some(name) = node["name"].as_str() {
+                                proxies.entry(name).or_insert_with(|| node.clone());
+                            }
+                        }
+                    }
+                }
                 let raw = app.raw_config.read();
                 let mut all = vec!["DIRECT".to_string(), "REJECT".to_string()];
                 for group in raw.proxy_groups.as_deref().unwrap_or(&[]) {
@@ -118,7 +158,7 @@ impl Host {
             }
             "asyncTestDelay" => {
                 result = json!({"name":string_field(arguments,"proxy-name")?,"value":result["delay"],"url":string_field(arguments,"test-url")?});
-                self.emit_bulk("delay", result.clone());
+                self.emit_bulk("delay", &result);
             }
             "getExternalProviders" => {
                 let mut providers: Vec<Value> = result["providers"]
@@ -140,8 +180,17 @@ impl Host {
                 result = json!(providers);
             }
             "getExternalProvider" => normalize_provider(&mut result),
+            "getConnections" => {
+                for connection in result["connections"].as_array_mut().into_iter().flatten() {
+                    for port in ["sourcePort", "destinationPort"] {
+                        if let Some(number) = connection["metadata"][port].as_u64() {
+                            connection["metadata"][port] = json!(number.to_string());
+                        }
+                    }
+                }
+            }
             "updateExternalProvider" => {
-                self.emit("loaded", arguments.clone());
+                self.emit("loaded", arguments);
                 result = json!("");
             }
             "changeProxy" => {

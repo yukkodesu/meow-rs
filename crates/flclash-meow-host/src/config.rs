@@ -48,7 +48,10 @@ pub fn parse(content: &str, home: Option<&Path>) -> Result<(RawConfig, CheckResu
             "external-ui-url",
             "subscriptions",
         ] {
-            if map.contains_key(Value::String(key.into())) {
+            if map
+                .get(Value::String(key.into()))
+                .is_some_and(|v| !v.is_null())
+            {
                 diagnostics.push(problem(
                     key,
                     "This field is not supported by the embedded desktop host",
@@ -68,7 +71,10 @@ pub fn parse(content: &str, home: Option<&Path>) -> Result<(RawConfig, CheckResu
                 "include-uid",
                 "exclude-uid",
             ] {
-                if tun.contains_key(Value::String(key.into())) {
+                if tun
+                    .get(Value::String(key.into()))
+                    .is_some_and(|v| !v.is_null())
+                {
                     diagnostics.push(problem(
                         format!("tun.{key}"),
                         "meow-rs ignores this capture setting",
@@ -78,7 +84,10 @@ pub fn parse(content: &str, home: Option<&Path>) -> Result<(RawConfig, CheckResu
         }
         if let Some(geo) = document.get("geodata").and_then(Value::as_mapping) {
             for key in ["geodata-mode", "geodata-loader", "geoip-matcher"] {
-                if geo.contains_key(Value::String(key.into())) {
+                if geo
+                    .get(Value::String(key.into()))
+                    .is_some_and(|v| !v.is_null())
+                {
                     diagnostics.push(Diagnostic {
                         severity: "warning",
                         path: format!("geodata.{key}"),
@@ -98,6 +107,53 @@ pub fn parse(content: &str, home: Option<&Path>) -> Result<(RawConfig, CheckResu
         .enumerate()
     {
         check_proxy(node, &format!("proxies[{index}]"), &mut diagnostics);
+    }
+    for (index, listener) in document
+        .get("listeners")
+        .and_then(Value::as_sequence)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        if let Some(map) = listener.as_mapping() {
+            let path = format!("listeners[{index}]");
+            check_keys(
+                map,
+                "name type listen port max-connections",
+                &path,
+                &mut diagnostics,
+            );
+            if !matches!(
+                listener.get("type").and_then(Value::as_str),
+                Some("mixed" | "http" | "socks5")
+            ) {
+                diagnostics.push(problem(
+                    format!("{path}.type"),
+                    "This desktop host only embeds HTTP, SOCKS5 and mixed listeners",
+                ));
+            }
+        }
+    }
+    if let Some(sniffer) = document.get("sniffer") {
+        if sniffer
+            .get("force-dns-mapping")
+            .is_some_and(|v| !v.is_null())
+        {
+            diagnostics.push(problem(
+                "sniffer.force-dns-mapping",
+                "meow-rs ignores this DNS behavior setting",
+            ));
+        }
+        if let Some(sniff) = sniffer.get("sniff").and_then(Value::as_mapping) {
+            for protocol in sniff.keys() {
+                if !matches!(protocol.as_str(), Some("TLS" | "HTTP")) {
+                    diagnostics.push(problem(
+                        format!("sniffer.sniff.{}", protocol.as_str().unwrap_or("?")),
+                        "Unsupported sniff protocol",
+                    ));
+                }
+            }
+        }
     }
     for (kind, providers) in [
         ("proxy-providers", document.get("proxy-providers")),
@@ -191,18 +247,18 @@ fn check_proxy(node: &Value, path: &str, diagnostics: &mut Vec<Diagnostic>) {
     let Some(map) = node.as_mapping() else {
         return;
     };
-    let common = "name type server port udp dialer-proxy";
+    let common = "name type dialer-proxy";
     let fields = match node.get("type").and_then(Value::as_str).unwrap_or("") {
-        "direct" => "connect-timeout",
-        "ss" => "password cipher plugin plugin-opts client-fingerprint smux mux",
-        "trojan" => "password sni skip-cert-verify smux mux",
-        "vless" => "uuid tls servername sni skip-cert-verify flow encryption client-fingerprint reality-opts ech-opts network ws-opts grpc-opts h2-opts http-upgrade-opts xhttp-opts smux mux alpn",
-        "vmess" => "uuid alterId cipher tls servername sni skip-cert-verify client-fingerprint network ws-opts grpc-opts h2-opts http-upgrade-opts smux mux alpn",
-        "http" => "username password tls sni skip-cert-verify headers fingerprint",
-        "socks5" => "username password tls sni skip-cert-verify",
-        "anytls" => "password sni skip-cert-verify alpn client-fingerprint idle-session-check-interval idle-session-timeout min-idle-session",
-        "hysteria2" => "password sni skip-cert-verify alpn obfs obfs-password up down ports hop-interval fingerprint",
-        "snell" => "psk version obfs-opts reuse",
+        "direct" => "dns connect-timeout",
+        "ss" => "server port udp password cipher plugin plugin-opts client-fingerprint smux mux",
+        "trojan" => "server port udp password sni skip-cert-verify smux mux",
+        "vless" => "server port udp uuid tls servername skip-cert-verify flow encryption client-fingerprint reality-opts ech-opts network ws-opts grpc-opts h2-opts http-upgrade-opts xhttp-opts smux mux alpn",
+        "vmess" => "server port udp uuid alterId cipher tls servername skip-cert-verify client-fingerprint network ws-opts grpc-opts h2-opts http-upgrade-opts smux mux alpn",
+        "http" => "server port username password tls skip-cert-verify headers",
+        "socks5" => "server port udp username password tls skip-cert-verify",
+        "anytls" => "server port udp password sni skip-cert-verify",
+        "hysteria2" => "server port udp password sni skip-cert-verify alpn obfs obfs-password up down ports hop-interval fingerprint",
+        "snell" => "server port udp psk version mode obfs-opts reuse",
         unknown => {diagnostics.push(problem(format!("{path}.type"),format!("Unsupported proxy protocol: {unknown}"))); ""},
     };
     check_keys(map, &format!("{common} {fields}"), path, diagnostics);

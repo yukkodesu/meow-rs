@@ -9,8 +9,9 @@ async fn main() -> anyhow::Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Usage: flclash-meow-host <IPC address>"))?;
     if address == "--version" {
         println!(
-            "flclash-meow-host {} (meow-rs 0.22.0, {})",
+            "flclash-meow-host {} (meow-rs {}, {})",
             env!("CARGO_PKG_VERSION"),
+            env!("MEOW_CORE_VERSION"),
             env!("MEOW_HOST_COMMIT")
         );
         return Ok(());
@@ -60,7 +61,7 @@ async fn connect(
                     && (error.kind() == std::io::ErrorKind::NotFound
                         || error.raw_os_error() == Some(231)) =>
             {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
             Err(error) => return Err(error.into()),
         }
