@@ -125,13 +125,12 @@ impl Host {
         }
         match method {
             "getProxies" => {
-                let providers = Runtime::request(
+                let providers = tokio::select! {result=Runtime::request(
                     router.clone(),
                     "GET",
                     "/providers/proxies".into(),
                     Value::Null,
-                )
-                .await?;
+                )=>result?,_=generation.changed()=>return Err(cancelled())};
                 if let Some(providers) = providers["providers"].as_object() {
                     let proxies = result["proxies"]
                         .as_object_mut()
@@ -146,6 +145,11 @@ impl Host {
                 }
                 let raw = app.raw_config.read();
                 let mut all = vec!["DIRECT".to_string(), "REJECT".to_string()];
+                for name in ["GLOBAL", "COMPATIBLE"] {
+                    if result["proxies"].get(name).is_some() {
+                        all.push(name.into());
+                    }
+                }
                 for group in raw.proxy_groups.as_deref().unwrap_or(&[]) {
                     all.push(group.name.clone());
                 }
@@ -166,8 +170,7 @@ impl Host {
                     .into_iter()
                     .flat_map(|p| p.values().cloned())
                     .collect();
-                let rules =
-                    Runtime::request(router, "GET", "/providers/rules".into(), Value::Null).await?;
+                let rules = tokio::select! {result=Runtime::request(router,"GET","/providers/rules".into(),Value::Null)=>result?,_=generation.changed()=>return Err(cancelled())};
                 providers.extend(
                     rules["providers"]
                         .as_object()
@@ -204,8 +207,18 @@ impl Host {
             "closeConnections" | "resetConnections" | "closeConnection" => result = json!(true),
             _ => {}
         }
+        if generation.has_changed().unwrap_or(true) {
+            return Err(cancelled());
+        }
         Ok(result)
     }
+}
+
+fn cancelled() -> RpcError {
+    RpcError::new(
+        "request_cancelled",
+        "The runtime changed while this operation was pending",
+    )
 }
 
 fn normalize_provider(provider: &mut Value) {

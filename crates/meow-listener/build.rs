@@ -41,6 +41,7 @@ fn prepare_wintun() -> Result<(), String> {
     }
 
     if let Ok(src) = env::var("MEOW_WINTUN_DLL") {
+        println!("cargo:rerun-if-changed={src}");
         let src = PathBuf::from(src);
         if !src.is_file() {
             return Err(format!("MEOW_WINTUN_DLL is not a file: {}", src.display()));

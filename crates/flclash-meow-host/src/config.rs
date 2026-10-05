@@ -28,7 +28,7 @@ fn problem(path: impl Into<String>, reason: impl Into<String>) -> Diagnostic {
 }
 
 pub fn parse(content: &str, home: Option<&Path>) -> Result<(RawConfig, CheckResult), RpcError> {
-    let raw = meow_config::parse_raw_yaml(content)
+    let mut raw = meow_config::parse_raw_yaml(content)
         .map_err(|e| RpcError::new("invalid_config", e.to_string()))?;
     let mut document: Value = serde_yaml::from_str(content)
         .map_err(|e| RpcError::new("invalid_config", e.to_string()))?;
@@ -36,6 +36,11 @@ pub fn parse(content: &str, home: Option<&Path>) -> Result<(RawConfig, CheckResu
         .apply_merge()
         .map_err(|e| RpcError::new("invalid_config", e.to_string()))?;
     let mut diagnostics = Vec::new();
+    if let Some(level) = raw.log_level.as_deref() {
+        if !meow_api::log_stream::is_valid_log_level(level) {
+            diagnostics.push(problem("log-level", "Unsupported log level"));
+        }
+    }
     let _: RawConfig = serde_ignored::deserialize(document.clone(), |path| {
         diagnostics.push(problem(path.to_string(), "Unknown configuration field"));
     })
@@ -162,6 +167,13 @@ pub fn parse(content: &str, home: Option<&Path>) -> Result<(RawConfig, CheckResu
         if let Some(providers) = providers.and_then(Value::as_mapping) {
             for (name, provider) in providers {
                 let name = name.as_str().unwrap_or("?");
+                if let (Some(home), Some(path)) =
+                    (home, provider.get("path").and_then(Value::as_str))
+                {
+                    if let Err(error) = contained_path(home, path) {
+                        diagnostics.push(problem(format!("{kind}.{name}.path"), error.message));
+                    }
+                }
                 if let Some(overrides) = provider.get("override").and_then(Value::as_mapping) {
                     check_keys(
                         overrides,
@@ -184,26 +196,24 @@ pub fn parse(content: &str, home: Option<&Path>) -> Result<(RawConfig, CheckResu
         }
     }
     if let Some(home) = home {
-        if let Some(geodata) = raw.geodata.as_ref() {
-            for (key, path) in [
-                ("mmdb-path", &geodata.mmdb_path),
-                ("asn-path", &geodata.asn_path),
-                ("geosite-path", &geodata.geosite_path),
-            ] {
-                if let Some(path) = path {
-                    if let Err(e) = contained_path(home, path) {
-                        diagnostics.push(problem(format!("geodata.{key}"), e.message));
-                    }
-                }
+        let geodata = raw.geodata.get_or_insert_with(Default::default);
+        for (key, path, default) in [
+            ("mmdb-path", &mut geodata.mmdb_path, "Country.mmdb"),
+            ("asn-path", &mut geodata.asn_path, "GeoLite2-ASN.mmdb"),
+            ("geosite-path", &mut geodata.geosite_path, "geosite.dat"),
+        ] {
+            match contained_path(home, path.as_deref().unwrap_or(default)) {
+                Ok(resolved) => *path = Some(resolved.to_string_lossy().into_owned()),
+                Err(e) => diagnostics.push(problem(format!("geodata.{key}"), e.message)),
             }
         }
-        if let Some(path) = raw.external_ui.as_ref() {
-            if let Err(e) = contained_path(home, path) {
-                diagnostics.push(problem("external-ui", e.message));
+        if let Some(path) = raw.external_ui.as_mut() {
+            match contained_path(home, path) {
+                Ok(resolved) => *path = resolved.to_string_lossy().into_owned(),
+                Err(e) => diagnostics.push(problem("external-ui", e.message)),
             }
         }
     }
-    let mut raw = raw;
     raw.strict = Some(true);
     let valid = !diagnostics.iter().any(|d| d.severity == "error");
     Ok((raw, CheckResult { valid, diagnostics }))
@@ -248,6 +258,16 @@ fn check_proxy(node: &Value, path: &str, diagnostics: &mut Vec<Diagnostic>) {
         return;
     };
     let common = "name type dialer-proxy";
+    if node.get("type").and_then(Value::as_str) == Some("direct")
+        && node.get("name").and_then(Value::as_str) != Some("DIRECT")
+    {
+        diagnostics.push(Diagnostic {
+            severity: "error",
+            path: format!("{path}.name"),
+            reason: "meow-rs direct adapters always expose the name DIRECT; aliases cannot be selected or referenced reliably".into(),
+            suggestion: "Use the built-in DIRECT target instead of a named direct alias.",
+        });
+    }
     let fields = match node.get("type").and_then(Value::as_str).unwrap_or("") {
         "direct" => "dns connect-timeout",
         "ss" => "server port udp password cipher plugin plugin-opts client-fingerprint smux mux",
@@ -265,19 +285,36 @@ fn check_proxy(node: &Value, path: &str, diagnostics: &mut Vec<Diagnostic>) {
     for (key, fields) in [
         ("reality-opts", "public-key short-id support-x25519mlkem768"),
         ("ech-opts", "enable config dns"),
-        ("ws-opts", "path headers max-early-data early-data-header-name"),
+        (
+            "ws-opts",
+            "path headers max-early-data early-data-header-name",
+        ),
         ("grpc-opts", "grpc-service-name no-grpc-header"),
         ("h2-opts", "host path headers"),
         ("http-upgrade-opts", "path headers host"),
         ("xhttp-opts", "path mode headers host x-padding-bytes"),
         ("obfs-opts", "mode host"),
-        ("smux", "enabled protocol max-connections min-streams max-streams padding-only-brutal brutal-opts"),
-        ("mux", "enable enabled protocol max-connections min-streams max-streams padding concurrency"),
+        (
+            "smux",
+            "enabled protocol max-connections min-streams max-streams padding only-tcp",
+        ),
+        (
+            "mux",
+            "enabled protocol max-connections min-streams max-streams padding only-tcp",
+        ),
     ] {
         if let Some(opts) = node.get(key).and_then(Value::as_mapping) {
             check_keys(opts, fields, &format!("{path}.{key}"), diagnostics);
-            if let Some(brutal) = opts.get(Value::String("brutal-opts".into())).and_then(Value::as_mapping) {
-                check_keys(brutal,"enabled up down",&format!("{path}.{key}.brutal-opts"),diagnostics);
+            if let Some(brutal) = opts
+                .get(Value::String("brutal-opts".into()))
+                .and_then(Value::as_mapping)
+            {
+                check_keys(
+                    brutal,
+                    "enabled up down",
+                    &format!("{path}.{key}.brutal-opts"),
+                    diagnostics,
+                );
             }
         }
     }
@@ -304,20 +341,27 @@ fn check_proxy(node: &Value, path: &str, diagnostics: &mut Vec<Diagnostic>) {
 
 pub fn contained_path(home: &Path, relative: &str) -> Result<PathBuf, RpcError> {
     let path = Path::new(relative);
-    if path.is_absolute()
-        || path.components().any(|c| {
-            !matches!(
-                c,
-                std::path::Component::Normal(_) | std::path::Component::CurDir
-            )
-        })
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+        || (!path.is_absolute()
+            && path.components().any(|c| {
+                matches!(
+                    c,
+                    std::path::Component::Prefix(_) | std::path::Component::RootDir
+                )
+            }))
     {
         return Err(RpcError::new(
             "invalid_path",
-            "Managed paths must be relative and remain inside the product home",
+            "Managed paths must remain inside the product home without parent traversal",
         ));
     }
-    let joined = home.join(path);
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        home.join(path)
+    };
     let mut existing = joined.as_path();
     while !existing.exists() {
         existing = existing

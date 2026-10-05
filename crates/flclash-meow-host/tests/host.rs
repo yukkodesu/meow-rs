@@ -43,6 +43,52 @@ async fn initialization_is_idle_and_unknown_nested_options_are_reported() {
     let malformed = call(&host, "checkConfig", json!("proxies: [")).await;
     assert_eq!(malformed["valid"], false);
     assert_eq!(malformed["diagnostics"][0]["path"], "$");
+    let alias = call(
+        &host,
+        "checkConfig",
+        json!("proxies: [{name: local, type: direct}]\nrules: ['MATCH,local']\n"),
+    )
+    .await;
+    assert_eq!(alias["valid"], false);
+    assert!(alias["diagnostics"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|d| d["path"] == "proxies[0].name"));
+    let outside = tempfile::tempdir().unwrap();
+    for path in [
+        "../../../config.yaml".to_string(),
+        outside
+            .path()
+            .join("private.yaml")
+            .to_string_lossy()
+            .into_owned(),
+    ] {
+        let yaml = serde_yaml::to_string(&json!({"proxy-providers":{"private":{"type":"file","path":path}},"proxy-groups":[{"name":"group","type":"select","use":["private"]}]})).unwrap();
+        let checked = call(&host, "checkConfig", json!(yaml)).await;
+        assert_eq!(checked["valid"], false);
+        assert!(checked["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["path"] == "proxy-providers.private.path"));
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+        let checked = call(
+            &host,
+            "checkConfig",
+            json!("proxy-providers:\n  private:\n    type: file\n    path: escape/private.yaml\n"),
+        )
+        .await;
+        assert_eq!(checked["valid"], false);
+        assert!(checked["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["path"] == "proxy-providers.private.path"));
+    }
     assert!(!call(&host, "validateConfig", json!("proxies: ["))
         .await
         .as_str()
@@ -78,6 +124,9 @@ async fn proxy_ready_transfers_data_and_failed_replacement_restores_the_previous
     drop(reservation);
     let host = Host::new();
     let dir = tempfile::tempdir().unwrap();
+    for file in ["Country.mmdb", "GeoLite2-ASN.mmdb", "geosite.dat"] {
+        tokio::fs::write(dir.path().join(file), []).await.unwrap();
+    }
     call(
         &host,
         "initClash",
