@@ -1307,6 +1307,7 @@ dependencies = [
  "anyhow",
  "axum",
  "dashmap",
+ "libc",
  "meow-api",
  "meow-app",
  "meow-common",
@@ -2590,13 +2591,17 @@ dependencies = [
  "meow-tunnel",
  "parking_lot",
  "route_manager",
+ "serde",
+ "serde_json",
  "shadowsocks",
  "smallvec",
  "smol_str",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
  "tun-rs",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

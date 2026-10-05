@@ -196,6 +196,10 @@ pub fn parse(content: &str, home: Option<&Path>) -> Result<(RawConfig, CheckResu
         }
     }
     if let Some(home) = home {
+        #[cfg(unix)]
+        if raw.external_ui.is_some() && unsafe { libc::geteuid() } == 0 {
+            diagnostics.push(problem("external-ui", "An elevated host cannot securely serve caller-supplied static files; use the built-in dashboard"));
+        }
         let geodata = raw.geodata.get_or_insert_with(Default::default);
         for (key, path, default) in [
             ("mmdb-path", &mut geodata.mmdb_path, "Country.mmdb"),

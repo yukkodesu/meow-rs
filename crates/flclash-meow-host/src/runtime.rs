@@ -29,6 +29,7 @@ pub struct Runtime {
     running: bool,
     failure: Arc<RwLock<Option<String>>>,
     binding: Option<meow_api::PreinstalledBinding>,
+    pending_tun: Option<tokio::task::JoinHandle<()>>,
     background: background::Background,
 }
 
@@ -76,6 +77,7 @@ impl Runtime {
             running: false,
             failure: Arc::new(RwLock::new(None)),
             binding,
+            pending_tun: None,
             background: background::Background::new(home),
         }
     }
@@ -94,10 +96,10 @@ impl Runtime {
         if self.running() {
             return Ok(());
         }
-        self.stop().await;
+        self.stop().await?;
         let outcome = self.start_inner().await;
         if outcome.is_err() {
-            self.stop().await;
+            self.stop().await?;
         }
         outcome
     }
@@ -169,20 +171,24 @@ impl Runtime {
                 .take()
                 .unwrap_or_else(|| meow_api::preinstall_global_route_binding(&self.config.raw));
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+            let recovery_directory = crate::native::recovery_directory().map_err(|error| {
+                RpcError::new("tun_failed", format!("TUN recovery directory: {error}"))
+            })?;
             let mut listener = meow_listener::TunListener::new(
                 self.state.tunnel.clone(),
                 meow_api::tun_config_to_listener_config(&self.config.tun),
                 "FlClashMeowTun".into(),
             )
-            .with_readiness_signal(ready_tx);
+            .with_readiness_signal(ready_tx)
+            .with_recovery_directory(recovery_directory);
             if let Some(binding) = binding.into_binding() {
                 listener = listener.with_outbound_binding(binding);
             }
-            let task = tokio::spawn(async move {
+            self.pending_tun = Some(tokio::spawn(async move {
                 if let Err(e) = listener.run().await {
                     tracing::error!("TUN failed: {e}");
                 }
-            });
+            }));
             match tokio::time::timeout(meow_api::TUN_STARTUP_TIMEOUT, ready_rx).await {
                 Ok(Ok(meow_listener::TunReady::Ready {
                     core_done,
@@ -191,15 +197,16 @@ impl Runtime {
                     self.state
                         .tunnel
                         .set_tun_handle(meow_tunnel::TunHandle {
-                            task,
+                            task: self.pending_tun.take().expect("owned pending TUN task"),
                             core_done: Some(core_done),
                             udp_flows,
                         })
-                        .await;
+                        .await
+                        .map_err(|error| {
+                            RpcError::new("resources_release_unconfirmed", error.to_string())
+                        })?;
                 }
                 result => {
-                    task.abort();
-                    let _ = task.await;
                     let reason = match result {
                         Ok(Ok(meow_listener::TunReady::Failed(reason))) => reason,
                         _ => "TUN readiness failed or timed out".into(),
@@ -277,7 +284,7 @@ impl Runtime {
         Ok(())
     }
 
-    pub async fn stop(&mut self) {
+    pub async fn stop(&mut self) -> Result<(), RpcError> {
         self.running = false;
         self.background.clear();
         self.tasks.abort_all();
@@ -287,7 +294,23 @@ impl Runtime {
             dns.task.abort();
             let _ = dns.task.await;
         }
-        self.state.tunnel.stop_tun().await;
+        if let Some(task) = self.pending_tun.take() {
+            task.abort();
+            if let Err(error) = task.await {
+                if !error.is_cancelled() {
+                    self.state
+                        .tunnel
+                        .report_tun_cleanup_failure(error.to_string());
+                }
+            }
+        }
+        let mut cleanup = self.state.tunnel.stop_tun().await;
+        if let Err(error) = meow_listener::tun::await_tun_core_teardown().await {
+            self.state
+                .tunnel
+                .report_tun_cleanup_failure(error.to_string());
+            cleanup = Err(error);
+        }
         self.state.tunnel.statistics().close_all_connections();
         self.state.tunnel.close_all_udp_sessions();
         self.state.tunnel.reconcile_health_checks(&[]);
@@ -298,7 +321,19 @@ impl Runtime {
             .proxy_provider_refresh
             .reconcile(&Arc::new(DashMap::new()), None);
         meow_common::clear_host_resolver();
-        *self.failure.write() = None;
+        match cleanup {
+            Ok(()) => {
+                *self.failure.write() = None;
+                Ok(())
+            }
+            Err(error) => {
+                *self.failure.write() = Some(format!("resources_release_unconfirmed: {error}"));
+                Err(RpcError::new(
+                    "resources_release_unconfirmed",
+                    error.to_string(),
+                ))
+            }
+        }
     }
 
     pub async fn request(
@@ -356,6 +391,9 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.tasks.abort_all();
+        if let Some(task) = self.pending_tun.take() {
+            task.abort();
+        }
         if let Some(dns) = self.state.dns_server.write().take() {
             dns.task.abort();
         }

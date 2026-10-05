@@ -1259,7 +1259,7 @@ async fn commit_raw_candidate(
         preinstalled,
         TrackedTcp::Cancel,
     )
-    .await;
+    .await?;
     Ok(())
 }
 
@@ -2532,7 +2532,7 @@ async fn swap_config_and_reconcile_tun(
     prior_resolver: Arc<meow_dns::Resolver>,
     mut preinstalled: PreinstalledBinding,
     tracked_tcp: TrackedTcp,
-) {
+) -> Result<(), (StatusCode, String)> {
     debug_assert!(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
@@ -2648,13 +2648,21 @@ async fn swap_config_and_reconcile_tun(
         if old_enable && (fake_ip_changed || tun_changed) {
             // The candidate's binding (if global) is already in effect, so
             // the stop → spawn gap below is covered (issue #695).
-            state.tunnel.stop_tun().await;
+            state
+                .tunnel
+                .stop_tun()
+                .await
+                .map_err(|error| native_cleanup_error(&error))?;
             let raw = state.raw_config.read().clone();
             let binding = preinstalled.take_binding();
             let adopted = binding.is_some();
             match spawn_tun_from_raw(&state.tunnel, &raw, binding).await {
                 Ok(Some(handle)) => {
-                    state.tunnel.set_tun_handle(handle).await;
+                    state
+                        .tunnel
+                        .set_tun_handle(handle)
+                        .await
+                        .map_err(|error| native_cleanup_error(&error))?;
                     info!(
                         fake_ip_changed,
                         tun_changed, "TUN listener restarted via config reload"
@@ -2684,7 +2692,7 @@ async fn swap_config_and_reconcile_tun(
                 }
             }
         }
-        return;
+        return Ok(());
     }
     if let Some(snapshot) = snapshot {
         // off → on. Defensive: if a handle somehow outlives a raw config
@@ -2692,12 +2700,20 @@ async fn swap_config_and_reconcile_tun(
         // listener must never build a second lwIP core over a live one
         // (its PREVIOUS_CORE gate hard-fails the spawn after a 10 s
         // teardown timeout rather than stack two generations).
-        state.tunnel.stop_tun().await;
+        state
+            .tunnel
+            .stop_tun()
+            .await
+            .map_err(|error| native_cleanup_error(&error))?;
         let binding = preinstalled.take_binding();
         let adopted = binding.is_some();
         match spawn_tun_from_raw(&state.tunnel, &snapshot, binding).await {
             Ok(Some(handle)) => {
-                state.tunnel.set_tun_handle(handle).await;
+                state
+                    .tunnel
+                    .set_tun_handle(handle)
+                    .await
+                    .map_err(|error| native_cleanup_error(&error))?;
                 info!("TUN listener started via config reload");
                 if adopted {
                     outbound_binding_adopted(state, preinstalled.interface_changed(), tracked_tcp);
@@ -2725,9 +2741,21 @@ async fn swap_config_and_reconcile_tun(
         }
     } else {
         // on → off
-        state.tunnel.stop_tun().await;
+        state
+            .tunnel
+            .stop_tun()
+            .await
+            .map_err(|error| native_cleanup_error(&error))?;
         info!("TUN listener stopped via config reload");
     }
+    Ok(())
+}
+
+fn native_cleanup_error(error: &std::io::Error) -> (StatusCode, String) {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("TUN resources release unconfirmed: {error}"),
+    )
 }
 
 /// A committed mutation's TUN listener came up with the global-route binding
@@ -3014,7 +3042,7 @@ async fn put_configs(
         let prior_resolver = state.tunnel.resolver();
         // No `reload_routing` ran, so tracked TCP predating the binding
         // is still live.
-        swap_config_and_reconcile_tun(
+        if let Err((status, message)) = swap_config_and_reconcile_tun(
             &state,
             raw_config,
             None,
@@ -3022,7 +3050,10 @@ async fn put_configs(
             preinstalled,
             TrackedTcp::Cancel,
         )
-        .await;
+        .await
+        {
+            return (status, Json(serde_json::json!({"message": message}))).into_response();
+        }
         return StatusCode::NO_CONTENT.into_response();
     };
     let meow_config::RebuildResult {
@@ -3178,7 +3209,7 @@ async fn put_configs(
 
     // `reload_routing` above ran after the pre-install and cancelled every
     // tracked TCP flow; any admitted since dialled under the binding.
-    swap_config_and_reconcile_tun(
+    if let Err((status, message)) = swap_config_and_reconcile_tun(
         &state,
         raw_config,
         dns,
@@ -3186,7 +3217,10 @@ async fn put_configs(
         preinstalled,
         TrackedTcp::AlreadyCancelled,
     )
-    .await;
+    .await
+    {
+        return (status, Json(serde_json::json!({"message": message}))).into_response();
+    }
 
     StatusCode::NO_CONTENT.into_response()
 }
@@ -4666,7 +4700,8 @@ mod global_route_binding_tests {
                 core_done: None,
                 udp_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             })
-            .await;
+            .await
+            .unwrap();
         let restart =
             format!("{GLOBAL_LO}  mtu: 9000\n  device: meow-name-too-long-for-ifnamsiz\n");
         let (status, body) = put(&state, &candidate(&restart, &origin, "")).await;
