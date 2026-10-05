@@ -1,11 +1,16 @@
 $script:queryFailure = $false
+$script:adapterQueryFailure = $false
+$script:invalidGuid = $false
 function Get-NetAdapter {
+    if ($script:adapterQueryFailure) { throw 'Adapter provider query failed' }
     foreach ($index in 1..3) {
         [pscustomobject]@{
             InterfaceIndex = $index
-            InterfaceGuid = [guid](('11111111-1111-1111-1111-111111111111',
-                '22222222-2222-2222-2222-222222222222',
-                '33333333-3333-3333-3333-333333333333')[$index - 1])
+            InterfaceGuid = $(if ($script:invalidGuid -and $index -eq 1) { 'not-a-guid' }
+                elseif ($index -eq 2) { [guid]'22222222-2222-2222-2222-222222222222' }
+                else { ('{11111111-1111-1111-1111-111111111111}',
+                    '{22222222-2222-2222-2222-222222222222}',
+                    '{AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA}')[$index - 1] })
         }
     }
 }

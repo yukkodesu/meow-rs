@@ -57,6 +57,27 @@ fn native_child_fixture() {
             ))
             .unwrap_err();
             assert!(error.to_string().contains("DNS provider query failed"));
+            for guid in [
+                "11111111-1111-1111-1111-111111111111",
+                "22222222-2222-2222-2222-222222222222",
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            ] {
+                let lookup = include_str!("../src/tun/windows_dns_adapter.ps1");
+                let output = meow_listener::tun::ownership::powershell(&format!(
+                    "{fixture}\n$guid = '{guid}'\n{lookup}\n([guid]$adapter[0].InterfaceGuid).ToString('D')"
+                )).unwrap();
+                assert_eq!(output, guid);
+            }
+            let error = meow_listener::tun::ownership::powershell(&format!(
+                "{fixture}\n$script:adapterQueryFailure = $true\n{plan}"
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("Adapter provider query failed"));
+            let error = meow_listener::tun::ownership::powershell(&format!(
+                "{fixture}\n$script:invalidGuid = $true\n{plan}"
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("not-a-guid"));
         }
         _ => {}
     }
@@ -132,4 +153,33 @@ fn cleanup_commands_own_and_reap_their_children() {
     assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     let error = owned_command_output(&mut child("flood"), Duration::from_secs(5)).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::FileTooLarge);
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "read-only inspection of actual Windows adapters; opt in explicitly"]
+fn windows_dns_plan_readonly_inspection() {
+    assert_eq!(
+        std::env::var("MEOW_NATIVE_READ_ONLY_INSPECTION").as_deref(),
+        Ok("1")
+    );
+    let output =
+        meow_listener::tun::ownership::powershell(include_str!("../src/tun/windows_dns_plan.ps1"))
+            .unwrap();
+    let resources: Vec<String> = serde_json::from_str(&output).unwrap();
+    for resource in &resources {
+        let (guid, family) = resource.split_once('|').unwrap();
+        assert_eq!(guid.len(), 36);
+        assert!(matches!(family, "IPv4" | "IPv6"));
+        let lookup = include_str!("../src/tun/windows_dns_adapter.ps1");
+        let selected = meow_listener::tun::ownership::powershell(&format!(
+            "$guid = '{guid}'\n{lookup}\n([guid]$adapter[0].InterfaceGuid).ToString('D')"
+        ))
+        .unwrap();
+        assert_eq!(selected, guid);
+    }
+    println!(
+        "Read-only production DNS plan and adapter lookup inspected: {} resources",
+        resources.len()
+    );
 }

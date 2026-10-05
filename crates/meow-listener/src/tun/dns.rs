@@ -103,7 +103,8 @@ mod native {
         let (guid, family) = decode(resource)?;
         let service = if family == "IPv4" { "Tcpip" } else { "Tcpip6" };
         let output = run(&format!(
-            r#"$adapter = Get-NetAdapter | Where-Object {{ $_.InterfaceGuid.ToString() -eq '{guid}' }}; if (!$adapter) {{ throw 'Owned DNS adapter disappeared; restoration cannot be confirmed' }}; $key = Get-Item 'HKLM:\SYSTEM\CurrentControlSet\Services\{service}\Parameters\Interfaces\{{{guid}}}'; $value = $key.GetValue('NameServer', ''); $servers = @($value -split '[,;\s]+' | Where-Object {{ $_ }}); ConvertTo-Json -InputObject $servers -Compress"#
+            r#"$guid = '{guid}'; {adapter_lookup}; $key = Get-Item 'HKLM:\SYSTEM\CurrentControlSet\Services\{service}\Parameters\Interfaces\{{{guid}}}'; $value = $key.GetValue('NameServer', ''); $servers = @($value -split '[,;\s]+' | Where-Object {{ $_ }}); ConvertTo-Json -InputObject $servers -Compress"#,
+            adapter_lookup = include_str!("windows_dns_adapter.ps1"),
         ))?;
         let addresses: Vec<IpAddr> = serde_json::from_str(&output).map_err(io::Error::other)?;
         serde_json::to_string(&addresses)
@@ -133,7 +134,8 @@ mod native {
             )
         };
         run(&format!(
-            r#"$adapter = Get-NetAdapter | Where-Object {{ $_.InterfaceGuid.ToString() -eq '{guid}' }}; if (!$adapter) {{ throw 'Owned DNS adapter disappeared' }}; Get-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -AddressFamily {family} | Set-DnsClientServerAddress {action}"#
+            r#"$guid = '{guid}'; {adapter_lookup}; Get-DnsClientServerAddress -InterfaceIndex $adapter.InterfaceIndex -AddressFamily {family} | Set-DnsClientServerAddress {action}"#,
+            adapter_lookup = include_str!("windows_dns_adapter.ps1"),
         ))?;
         Ok(())
     }

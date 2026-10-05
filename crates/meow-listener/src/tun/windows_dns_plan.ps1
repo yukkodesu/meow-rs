@@ -1,6 +1,6 @@
 $adapters = @{}
 foreach ($adapter in @(Get-NetAdapter)) {
-    $adapters[$adapter.InterfaceIndex.ToString()] = $adapter.InterfaceGuid
+    $adapters[$adapter.InterfaceIndex.ToString()] = ([guid]$adapter.InterfaceGuid).ToString('D')
 }
 $families = @{2='IPv4'; 23='IPv6'}
 $ids = @(Get-DnsClientServerAddress | ForEach-Object {
