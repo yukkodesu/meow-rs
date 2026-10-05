@@ -348,14 +348,84 @@ pub fn powershell(script: &str) -> io::Result<String> {
     let executable =
         PathBuf::from(String::from_utf16(&buffer[..size as usize]).map_err(io::Error::other)?)
             .join("WindowsPowerShell/v1.0/powershell.exe");
-    let output = std::process::Command::new(executable).args([
+    let mut command = std::process::Command::new(executable);
+    command.args([
         "-NoProfile", "-NonInteractive", "-Command",
         &format!("[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false); $ErrorActionPreference='Stop'; {script}"),
-    ]).output()?;
+    ]);
+    let output = owned_command_output(&mut command, std::time::Duration::from_secs(20))?;
     if !output.status.success() {
         return Err(io::Error::other(
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
         ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+pub fn owned_command_output(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> io::Result<std::process::Output> {
+    use std::{io::Read, process::Stdio, time::Instant};
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let (exceeded, errors) = std::sync::mpsc::channel();
+    let read = |pipe: &mut dyn Read, exceeded: std::sync::mpsc::Sender<()>| {
+        let mut bytes = Vec::new();
+        pipe.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > 1024 * 1024 {
+            let _ = exceeded.send(());
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
+                "Native command output exceeded 1 MiB",
+            ));
+        }
+        Ok(bytes)
+    };
+    std::thread::scope(|scope| {
+        let output_exceeded = exceeded.clone();
+        let output = scope.spawn(move || read(&mut { stdout }, output_exceeded));
+        let error = scope.spawn(move || read(&mut { stderr }, exceeded));
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            if errors.try_recv().is_ok() {
+                break Err(io::Error::new(
+                    io::ErrorKind::FileTooLarge,
+                    "Native command output exceeded 1 MiB",
+                ));
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {}
+                Err(error) => break Err(error),
+            }
+            if Instant::now() >= deadline {
+                break Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Native command did not finish before its cleanup deadline",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        if status.is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let stdout = output
+            .join()
+            .map_err(|_| io::Error::other("Native stdout reader failed"))?;
+        let stderr = error
+            .join()
+            .map_err(|_| io::Error::other("Native stderr reader failed"))?;
+        Ok(std::process::Output {
+            status: status?,
+            stdout: stdout?,
+            stderr: stderr?,
+        })
+    })
 }
