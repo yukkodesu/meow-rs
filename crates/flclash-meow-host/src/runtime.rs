@@ -30,6 +30,7 @@ pub struct Runtime {
     failure: Arc<RwLock<Option<String>>>,
     binding: Option<meow_api::PreinstalledBinding>,
     pending_tun: Option<tokio::task::JoinHandle<()>>,
+    retired_dns: Vec<tokio::task::JoinHandle<()>>,
     background: background::Background,
 }
 
@@ -78,6 +79,7 @@ impl Runtime {
             failure: Arc::new(RwLock::new(None)),
             binding,
             pending_tun: None,
+            retired_dns: Vec::new(),
             background: background::Background::new(home),
         }
     }
@@ -92,12 +94,29 @@ impl Runtime {
         self.failure.read().clone()
     }
 
-    pub async fn start(&mut self) -> Result<(), RpcError> {
+    pub async fn start(
+        &mut self,
+        mut intent: tokio::sync::watch::Receiver<u64>,
+    ) -> Result<(), RpcError> {
         if self.running() {
             return Ok(());
         }
         self.stop().await?;
-        let outcome = self.start_inner().await;
+        let superseded = || {
+            RpcError::new(
+                "request_superseded",
+                "A later runtime intent superseded startup",
+            )
+        };
+        let outcome = if intent.has_changed().unwrap_or(true) {
+            Err(superseded())
+        } else {
+            tokio::select! {
+                biased;
+                _=intent.changed()=>Err(superseded()),
+                result=self.start_inner()=>result,
+            }
+        };
         if outcome.is_err() {
             self.stop().await?;
         }
@@ -291,10 +310,14 @@ impl Runtime {
         while self.tasks.join_next().await.is_some() {}
         let dns = self.state.dns_server.write().take();
         if let Some(dns) = dns {
-            dns.task.abort();
-            let _ = dns.task.await;
+            self.retired_dns.push(dns.task);
         }
-        if let Some(task) = self.pending_tun.take() {
+        while let Some(task) = self.retired_dns.last_mut() {
+            task.abort();
+            let _ = task.await;
+            self.retired_dns.pop();
+        }
+        if let Some(task) = self.pending_tun.as_mut() {
             task.abort();
             if let Err(error) = task.await {
                 if !error.is_cancelled() {
@@ -304,6 +327,7 @@ impl Runtime {
                 }
             }
         }
+        self.pending_tun = None;
         let mut cleanup = self.state.tunnel.stop_tun().await;
         if let Err(error) = meow_listener::tun::await_tun_core_teardown().await {
             self.state
@@ -391,6 +415,9 @@ impl Runtime {
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.tasks.abort_all();
+        for task in &self.retired_dns {
+            task.abort();
+        }
         if let Some(task) = self.pending_tun.take() {
             task.abort();
         }

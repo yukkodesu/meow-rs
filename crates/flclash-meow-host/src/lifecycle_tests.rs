@@ -96,3 +96,90 @@ async fn cleanup_failure_retains_the_session_and_prevents_runtime_replacement() 
         .to_string()
         .contains("fixture route restoration failure"));
 }
+
+#[tokio::test]
+async fn a_later_stop_cancels_startup_and_waits_for_core_release() {
+    let host = Arc::new(Host::new());
+    let home = tempfile::tempdir().unwrap();
+    assert!(call(
+        &host,
+        "initClash",
+        json!({"home-dir":home.path(),"version":1})
+    )
+    .await
+    .error
+    .is_none());
+    for file in ["Country.mmdb", "GeoLite2-ASN.mmdb", "geosite.dat"] {
+        tokio::fs::write(home.path().join(file), []).await.unwrap();
+    }
+    let occupied = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = occupied.local_addr().unwrap();
+    tokio::fs::write(
+        home.path().join("config.yaml"),
+        format!("mixed-port: {}\nrules: ['MATCH,DIRECT']\n", address.port()),
+    )
+    .await
+    .unwrap();
+    assert!(call(&host, "setupConfig", Value::Null)
+        .await
+        .error
+        .is_none());
+    let (core_done, core_wait) = tokio::sync::watch::channel(false);
+    let (released, release_started) = tokio::sync::oneshot::channel();
+    struct ListenerRelease(Option<tokio::sync::oneshot::Sender<()>>);
+    impl Drop for ListenerRelease {
+        fn drop(&mut self) {
+            if let Some(released) = self.0.take() {
+                let _ = released.send(());
+            }
+        }
+    }
+    let release = ListenerRelease(Some(released));
+    let task = tokio::spawn(async move {
+        let _release = release;
+        std::future::pending::<()>().await;
+    });
+    host.state
+        .lock()
+        .await
+        .runtime
+        .as_ref()
+        .unwrap()
+        .state
+        .tunnel
+        .set_tun_handle(meow_tunnel::TunHandle {
+            task,
+            core_done: Some(core_wait),
+            udp_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+        .await
+        .unwrap();
+    let starting = tokio::spawn({
+        let host = Arc::clone(&host);
+        async move { call(&host, "startListener", Value::Null).await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(2), release_started)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut stopping = Box::pin(call(&host, "stopListener", Value::Null));
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(20), &mut stopping)
+            .await
+            .is_err(),
+        "Stop must await the retired core release"
+    );
+    core_done.send(true).unwrap();
+    assert_eq!(
+        starting.await.unwrap().error.unwrap().code,
+        "request_superseded"
+    );
+    assert_eq!(stopping.await.result, true);
+    let state = call(&host, "getRuntimeState", Value::Null).await.result;
+    assert_eq!(state["running"], false);
+    assert!(state["listeners"].as_array().unwrap().is_empty());
+    drop(occupied);
+    assert_eq!(call(&host, "startListener", Value::Null).await.result, true);
+    assert!(tokio::net::TcpStream::connect(address).await.is_ok());
+    host.shutdown().await.unwrap();
+}

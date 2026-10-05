@@ -89,7 +89,24 @@ async fn endpoints_configuration_logs_and_traffic() {
     )
     .await
     .unwrap();
-    tokio::fs::write(home.path().join("config.yaml"), "listeners:\n  - name: local\n    type: mixed\n    listen: 127.0.0.1\n    port: 0\nexternal-controller: 127.0.0.1:0\nexternal-ui: dashboard\nmode: rule\nlog-level: debug\nrules: ['MATCH,REJECT']\nhosts: { test.example: 127.0.0.42 }\ndns:\n  enable: true\n  listen: 127.0.0.1:0\n").await.unwrap();
+    #[cfg(unix)]
+    let custom_ui = unsafe { libc::geteuid() } != 0;
+    #[cfg(not(unix))]
+    let custom_ui = true;
+    let mut profile = "listeners:\n  - name: local\n    type: mixed\n    listen: 127.0.0.1\n    port: 0\nexternal-controller: 127.0.0.1:0\nexternal-ui: dashboard\nmode: rule\nlog-level: debug\nrules: ['MATCH,REJECT']\nhosts: { test.example: 127.0.0.42 }\ndns:\n  enable: true\n  listen: 127.0.0.1:0\n".to_string();
+    if !custom_ui {
+        let check = call(&host, "checkConfig", json!(profile)).await;
+        assert_eq!(check["valid"], false);
+        assert!(check["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|diagnostic| diagnostic["path"] == "external-ui"));
+        profile = profile.replace("external-ui: dashboard\n", "");
+    }
+    tokio::fs::write(home.path().join("config.yaml"), profile)
+        .await
+        .unwrap();
     call(&host, "setupConfig", Value::Null).await;
     call(&host, "startListener", Value::Null).await;
     let state = call(&host, "getRuntimeState", Value::Null).await;
@@ -99,9 +116,11 @@ async fn endpoints_configuration_logs_and_traffic() {
     assert_ne!(proxy.parse::<std::net::SocketAddr>().unwrap().port(), 0);
     let configs = request(controller, "/configs").await;
     assert!(configs.contains("\"mode\":\"rule\""));
-    assert!(request(controller, "/ui/index.html")
-        .await
-        .ends_with("product-home-dashboard"));
+    if custom_ui {
+        assert!(request(controller, "/ui/index.html")
+            .await
+            .ends_with("product-home-dashboard"));
+    }
     let dns_peer = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     dns_peer
         .send_to(

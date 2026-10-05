@@ -1,5 +1,29 @@
 #![cfg(feature = "listener-tun")]
 use meow_listener::tun::ownership::{OwnedResources, ResourceBackend};
+
+#[test]
+fn journal_lease_excludes_competing_generations_and_releases_on_drop() {
+    use meow_listener::tun::ownership::JournalLease;
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("lease");
+    let first = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let lease = JournalLease::lock(first).unwrap();
+    let open = || {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap()
+    };
+    assert!(JournalLease::lock(open()).is_err());
+    drop(lease);
+    assert!(JournalLease::lock(open()).is_ok());
+}
 use std::{
     collections::HashMap,
     io,

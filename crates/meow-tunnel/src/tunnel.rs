@@ -139,6 +139,8 @@ pub struct TunnelInner {
     /// Handle to the running TUN listener (if any). Abort + await it to
     /// stop TUN. Stored so `put_configs` can start/stop TUN at runtime.
     pub tun_handle: RwLock<Option<TunHandle>>,
+    tun_retired: RwLock<Vec<Arc<tokio::sync::Mutex<TunRetirement>>>>,
+    tun_transition: tokio::sync::Mutex<()>,
     tun_cleanup_failure: RwLock<Option<String>>,
     tun_native_owners: tokio::sync::watch::Sender<usize>,
     /// Health-check task set keyed by group name; reconciled on every
@@ -177,6 +179,11 @@ pub struct TunHandle {
     pub udp_flows: Arc<std::sync::atomic::AtomicUsize>,
 }
 
+struct TunRetirement {
+    handle: Option<TunHandle>,
+    task_reaped: bool,
+}
+
 pub struct TunResourceLease {
     owners: tokio::sync::watch::Sender<usize>,
 }
@@ -189,12 +196,11 @@ impl Drop for TunResourceLease {
 
 /// Upper bound on waiting for a torn-down lwIP core. Teardown is a
 /// synchronous pcb sweep — far under a second — so this only bounds a
-/// wedged core; proceeding past it logs loudly rather than hanging the
-/// config-mutation lane forever.
+/// wedged core. Failure blocks successor generations.
 const TUN_TEARDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Await a generation's `core_done` with the wedge bound. `RecvError`
-/// (sender dropped without signalling) means the core is already gone.
+/// (sender dropped without signalling) cannot certify core teardown.
 async fn await_core_done(mut rx: tokio::sync::watch::Receiver<bool>) -> std::io::Result<()> {
     match tokio::time::timeout(TUN_TEARDOWN_WAIT, rx.wait_for(|done| *done)).await {
         Ok(Ok(_)) => Ok(()),
@@ -213,23 +219,25 @@ async fn await_core_done(mut rx: tokio::sync::watch::Receiver<bool>) -> std::io:
 /// overlap this generation (issue #514). Shared by `stop_tun`,
 /// `set_tun_handle`'s previous-generation teardown, and
 /// `teardown_tun_handle` for handles that were never stored.
-async fn teardown_tun(handle: TunHandle) -> std::io::Result<()> {
-    let TunHandle {
-        task, core_done, ..
-    } = handle;
-    task.abort();
+async fn teardown_tun(retired: &mut TunRetirement) -> std::io::Result<()> {
+    let handle = retired.handle.as_mut().expect("owned retired TUN handle");
+    handle.task.abort();
     // Await the parent: dropping its future drops the TaskGroup, which
     // requests abort of the child tasks holding the device. The runtime
     // reaps those tasks asynchronously — the lwIP core only finishes
     // teardown once their stack halves drop, so await `core_done` too:
     // this returns only once the generation is truly gone.
-    if let Err(error) = task.await {
-        if !error.is_cancelled() {
-            return Err(std::io::Error::other(error));
+    if !retired.task_reaped {
+        let result = (&mut handle.task).await;
+        retired.task_reaped = true;
+        if let Err(error) = result {
+            if !error.is_cancelled() {
+                return Err(std::io::Error::other(error));
+            }
         }
     }
-    if let Some(done) = core_done {
-        await_core_done(done).await?;
+    if let Some(done) = &handle.core_done {
+        await_core_done(done.clone()).await?;
     }
     Ok(())
 }
@@ -708,6 +716,8 @@ impl Tunnel {
                 needs_ip_resolution: AtomicBool::new(false),
                 needs_process_lookup: AtomicBool::new(false),
                 tun_handle: RwLock::new(None),
+                tun_retired: RwLock::new(Vec::new()),
+                tun_transition: tokio::sync::Mutex::new(()),
                 tun_cleanup_failure: RwLock::new(None),
                 tun_native_owners: tokio::sync::watch::channel(0).0,
                 dialer_registry: std::sync::OnceLock::new(),
@@ -1069,58 +1079,91 @@ impl Tunnel {
         );
     }
 
-    /// Store a running TUN listener handle. If a previous TUN listener was
-    /// running, it is aborted and awaited — including its lwIP core's
-    /// teardown — before this returns (issue #514).
-    pub async fn set_tun_handle(&self, handle: TunHandle) -> std::io::Result<()> {
-        if let Err(error) = self.tun_cleanup_result() {
-            let _ = teardown_tun(handle).await;
-            return Err(error);
+    fn retain_retirement(&self, handle: TunHandle) -> Arc<tokio::sync::Mutex<TunRetirement>> {
+        let retired = Arc::new(tokio::sync::Mutex::new(TunRetirement {
+            handle: Some(handle),
+            task_reaped: false,
+        }));
+        self.inner.tun_retired.write().push(Arc::clone(&retired));
+        retired
+    }
+
+    async fn finish_retirement(
+        &self,
+        retired: &Arc<tokio::sync::Mutex<TunRetirement>>,
+    ) -> std::io::Result<()> {
+        let result = teardown_tun(&mut *retired.lock().await).await;
+        if let Err(error) = &result {
+            self.report_tun_cleanup_failure(error.to_string());
+        } else {
+            self.inner
+                .tun_retired
+                .write()
+                .retain(|entry| !Arc::ptr_eq(entry, retired));
         }
-        let previous = self.inner.tun_handle.write().take();
-        if let Some(previous) = previous {
-            if let Err(error) = teardown_tun(previous).await {
-                self.report_tun_cleanup_failure(error.to_string());
-                let _ = teardown_tun(handle).await;
-                return Err(error);
+        result
+    }
+
+    async fn finish_retired_except(
+        &self,
+        except: Option<&Arc<tokio::sync::Mutex<TunRetirement>>>,
+    ) -> std::io::Result<()> {
+        let retired = self.inner.tun_retired.read().clone();
+        let mut failure = None;
+        for entry in retired {
+            if except.is_some_and(|except| Arc::ptr_eq(&entry, except)) {
+                continue;
+            }
+            if let Err(error) = self.finish_retirement(&entry).await {
+                if failure.is_none() {
+                    failure = Some(error);
+                }
             }
         }
-        if let Err(error) = self.tun_cleanup_result() {
-            let _ = teardown_tun(handle).await;
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    /// Preserve every generation's teardown ownership across canceled callers.
+    pub async fn set_tun_handle(&self, handle: TunHandle) -> std::io::Result<()> {
+        let candidate = self.retain_retirement(handle);
+        let _transition = self.inner.tun_transition.lock().await;
+        if let Some(previous) = self.inner.tun_handle.write().take() {
+            self.retain_retirement(previous);
+        }
+        let result = self
+            .finish_retired_except(Some(&candidate))
+            .await
+            .and_then(|()| self.tun_cleanup_result());
+        if let Err(error) = result {
+            self.finish_retirement(&candidate).await?;
             return Err(error);
         }
-        *self.inner.tun_handle.write() = Some(handle);
+        let mut candidate_handle = candidate.lock().await;
+        *self.inner.tun_handle.write() = candidate_handle.handle.take();
+        self.inner
+            .tun_retired
+            .write()
+            .retain(|entry| !Arc::ptr_eq(entry, &candidate));
         info!("TUN listener handle stored");
         Ok(())
     }
 
-    /// Tear down a TUN listener handle that was never stored in the slot —
-    /// a startup that finished after the committed config already moved on
-    /// (#625): `stop_tun` operates on the *stored* slot and would kill a
-    /// successor a concurrent config mutation already installed. Same
-    /// abort + `core_done` teardown as the stored-slot paths.
     pub async fn teardown_tun_handle(&self, handle: TunHandle) -> std::io::Result<()> {
-        if let Err(error) = teardown_tun(handle).await {
-            self.report_tun_cleanup_failure(error.to_string());
-            return Err(error);
-        }
-        info!("discarded a stale TUN listener");
+        let retired = self.retain_retirement(handle);
+        let _transition = self.inner.tun_transition.lock().await;
+        self.finish_retirement(&retired).await?;
         self.tun_cleanup_result()
     }
 
-    /// Abort the running TUN listener, if any, and wait for teardown —
-    /// including the lwIP core's `core_done`, so a successor
-    /// `NetStack::new` can never overlap this generation (issue #514).
     pub async fn stop_tun(&self) -> std::io::Result<()> {
-        let handle = self.inner.tun_handle.write().take();
-        // parking_lot RwLock write guard is dropped here — safe to .await
-        if let Some(handle) = handle {
-            if let Err(error) = teardown_tun(handle).await {
-                self.report_tun_cleanup_failure(error.to_string());
-                return Err(error);
-            }
-            info!("TUN listener stopped");
+        let _transition = self.inner.tun_transition.lock().await;
+        if let Some(handle) = self.inner.tun_handle.write().take() {
+            self.retain_retirement(handle);
         }
+        self.finish_retired_except(None).await?;
         let mut owners = self.inner.tun_native_owners.subscribe();
         if tokio::time::timeout(TUN_TEARDOWN_WAIT, owners.wait_for(|count| *count == 0))
             .await
@@ -1135,7 +1178,6 @@ impl Tunnel {
         }
         self.tun_cleanup_result()
     }
-
     pub fn retain_tun_resources(&self) -> TunResourceLease {
         self.inner
             .tun_native_owners
