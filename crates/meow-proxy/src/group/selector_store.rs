@@ -31,11 +31,13 @@ impl SelectorStore {
     pub fn open(path: PathBuf) -> Arc<Self> {
         // Remove scratch siblings left by a crash between create and
         // rename (issue #621) — best-effort, before the load.
-        meow_common::fs_util::sweep_scratch_siblings(
-            &path,
-            meow_common::fs_util::SCRATCH_STALE_AGE,
-        );
-        let map = match std::fs::read(&path) {
+        if !meow_common::managed_files::is_managed() {
+            meow_common::fs_util::sweep_scratch_siblings(
+                &path,
+                meow_common::fs_util::SCRATCH_STALE_AGE,
+            );
+        }
+        let map = match meow_common::managed_files::read(&path) {
             Ok(bytes) => {
                 serde_json::from_slice::<HashMap<String, String>>(&bytes).unwrap_or_else(|e| {
                     warn!(path = %path.display(), error = %e,
@@ -114,6 +116,11 @@ impl SelectorStore {
 }
 
 fn write_atomic(path: &Path, map: &HashMap<String, String>) -> std::io::Result<()> {
+    if meow_common::managed_files::is_managed() {
+        let json = serde_json::to_vec_pretty(map).map_err(std::io::Error::other)?;
+        return meow_common::managed_files::write_atomic_if_managed(path, &json)
+            .expect("The product home policy cannot be removed");
+    }
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
