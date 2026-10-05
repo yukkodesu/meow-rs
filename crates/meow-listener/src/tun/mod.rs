@@ -120,15 +120,13 @@ pub struct RecoveryStatus {
     pub details: Vec<String>,
 }
 
-pub fn recover_existing_product_resources() -> RecoveryStatus {
+pub fn recover_tun_resources(path: &std::path::Path) -> io::Result<bool> {
     let outcome = (|| {
-        let path = ownership::product_recovery_path()?;
-        match std::fs::symlink_metadata(&path) {
+        match std::fs::symlink_metadata(path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
             Ok(_) => {}
         }
-        let path = ownership::flclash_meow_recovery_directory()?;
         let mut found = false;
         let mut errors = Vec::new();
         for (name, recover) in [
@@ -159,24 +157,7 @@ pub fn recover_existing_product_resources() -> RecoveryStatus {
             Err(io::Error::other(errors.join("; ")))
         }
     })();
-    match outcome {
-        Ok(found) => RecoveryStatus {
-            state: if found {
-                RecoveryState::Recovered
-            } else {
-                RecoveryState::Clean
-            },
-            details: Vec::new(),
-        },
-        Err(error) => RecoveryStatus {
-            state: if error.kind() == io::ErrorKind::PermissionDenied || !ownership::privileged() {
-                RecoveryState::NeedsPrivilege
-            } else {
-                RecoveryState::Failed
-            },
-            details: vec![error.to_string()],
-        },
-    }
+    outcome
 }
 
 /// Process-global serialization point for lwIP generations (issue #514).

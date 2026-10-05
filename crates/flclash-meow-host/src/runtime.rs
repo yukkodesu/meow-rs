@@ -171,10 +171,9 @@ impl Runtime {
                 .take()
                 .unwrap_or_else(|| meow_api::preinstall_global_route_binding(&self.config.raw));
             let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-            let recovery_directory =
-                meow_listener::tun::ownership::flclash_meow_recovery_directory().map_err(
-                    |error| RpcError::new("tun_failed", format!("TUN recovery directory: {error}")),
-                )?;
+            let recovery_directory = crate::native::recovery_directory().map_err(|error| {
+                RpcError::new("tun_failed", format!("TUN recovery directory: {error}"))
+            })?;
             let mut listener = meow_listener::TunListener::new(
                 self.state.tunnel.clone(),
                 meow_api::tun_config_to_listener_config(&self.config.tun),

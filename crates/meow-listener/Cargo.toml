@@ -72,6 +72,9 @@ tracing-subscriber = { workspace = true }
 smol_str = { workspace = true }
 tempfile.workspace = true
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }
+
 [[test]]
 name = "ss_listener_integration"
 required-features = ["listener-shadowsocks"]

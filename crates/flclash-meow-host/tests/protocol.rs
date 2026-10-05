@@ -69,7 +69,7 @@ async fn session_shutdown_flushes_correlated_acknowledgement_before_eof() {
 
 #[tokio::test]
 async fn external_shutdown_finishes_the_owned_session() {
-    use flclash_meow_host::{ipc::serve_until, Host};
+    use flclash_meow_host::{serve_until, Host};
     use std::sync::Arc;
     let (mut peer, stream) = tokio::io::duplex(32);
     let host = Arc::new(Host::new());

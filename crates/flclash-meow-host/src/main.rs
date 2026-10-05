@@ -1,4 +1,4 @@
-use flclash_meow_host::{ipc::serve_until, Host};
+use flclash_meow_host::{serve_until, Host};
 use std::sync::Arc;
 use tracing_subscriber::prelude::*;
 

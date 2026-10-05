@@ -119,6 +119,9 @@ impl ResourceBackend for NativeRoutes {
     fn owner_alive(&self, pid: u32) -> std::io::Result<bool> {
         super::ownership::owner_alive(pid)
     }
+    fn create_journal(&self, path: &std::path::Path) -> std::io::Result<std::fs::File> {
+        super::ownership::create_privileged_journal(path)
+    }
 }
 
 /// Detect the physical interface carrying the IPv4 default route, for

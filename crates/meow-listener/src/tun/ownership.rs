@@ -8,6 +8,12 @@ pub trait ResourceBackend {
     fn read(&mut self, resource: &str) -> io::Result<Option<String>>;
     fn write(&mut self, resource: &str, value: Option<&str>) -> io::Result<()>;
     fn owner_alive(&self, pid: u32) -> io::Result<bool>;
+    fn create_journal(&self, path: &Path) -> io::Result<fs::File> {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -119,6 +125,17 @@ impl<B: ResourceBackend> OwnedResources<B> {
     }
 
     pub fn recover(backend: &mut B, path: &Path) -> io::Result<()> {
+        match fs::symlink_metadata(path) {
+            Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
+                return Err(io::Error::other("Resource journal is not a regular file"))
+            }
+            Ok(metadata) if metadata.len() > 1024 * 1024 => {
+                return Err(io::Error::other("Resource journal exceeds its size limit"))
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+            _ => {}
+        }
         let record = match fs::read(path) {
             Ok(bytes) if bytes.len() <= 1024 * 1024 => {
                 serde_json::from_slice::<Record>(&bytes).map_err(io::Error::other)?
@@ -156,6 +173,7 @@ impl<B: ResourceBackend> OwnedResources<B> {
             }
         }
         save(
+            backend,
             path,
             &Record {
                 version: 1,
@@ -172,13 +190,18 @@ impl<B: ResourceBackend> OwnedResources<B> {
 
     fn persist(&self) -> io::Result<()> {
         match &self.path {
-            Some(path) => save(path, &self.record),
+            Some(path) => save(&self.backend, path, &self.record),
             None => Ok(()),
         }
     }
 }
 
-fn save(path: &Path, record: &Record) -> io::Result<()> {
+fn save(backend: &impl ResourceBackend, path: &Path, record: &Record) -> io::Result<()> {
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(io::Error::other("Resource journal is not a regular file"));
+        }
+    }
     if record.changes.is_empty() {
         return match fs::remove_file(path) {
             Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
@@ -190,10 +213,7 @@ fn save(path: &Path, record: &Record) -> io::Result<()> {
         Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
         _ => {}
     }
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&pending)?;
+    let mut file = backend.create_journal(&pending)?;
     serde_json::to_writer(&mut file, record).map_err(io::Error::other)?;
     file.sync_all()?;
     drop(file);
@@ -222,73 +242,72 @@ fn save(path: &Path, record: &Record) -> io::Result<()> {
     }
 }
 
-pub fn flclash_meow_recovery_directory() -> io::Result<PathBuf> {
+pub(super) fn create_privileged_journal(path: &Path) -> io::Result<fs::File> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        let path = PathBuf::from(if cfg!(target_os = "macos") {
-            "/Library/Application Support/FlClash-Meow/tun"
-        } else {
-            "/var/lib/flclash-meow/tun"
-        });
-        let parent = path
-            .parent()
-            .ok_or_else(|| io::Error::other("Invalid recovery directory"))?;
-        for directory in [parent, path.as_path()] {
-            match fs::create_dir(directory) {
-                Ok(()) => fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?,
-                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error),
-            }
-            let metadata = fs::symlink_metadata(directory)?;
-            if !metadata.is_dir()
-                || metadata.uid() != 0
-                || metadata.permissions().mode() & 0o077 != 0
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "Recovery directory must be root-owned, private and not a symlink",
-                ));
-            }
+        use std::os::unix::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::{ffi::OsStrExt, io::FromRawHandle};
+        use windows_sys::Win32::{
+            Foundation::{LocalFree, GENERIC_WRITE, INVALID_HANDLE_VALUE},
+            Security::{
+                Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW,
+                SECURITY_ATTRIBUTES,
+            },
+            Storage::FileSystem::{
+                CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ,
+            },
+        };
+        let descriptor: Vec<u16> = "O:BAG:BAD:P(A;;FA;;;BA)(A;;FA;;;SY)"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut security = std::ptr::null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                descriptor.as_ptr(),
+                1,
+                &mut security,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
         }
-        Ok(path)
-    }
-    #[cfg(windows)]
-    {
-        let script = r#"$ErrorActionPreference='Stop'; $base=[Environment]::GetFolderPath('CommonApplicationData'); $path=Join-Path $base 'FlClash-Meow'; foreach($directory in @($path,(Join-Path $path 'tun'))) { if (!(Test-Path -LiteralPath $directory)) { $null=New-Item -ItemType Directory -Path $directory; $acl=New-Object System.Security.AccessControl.DirectorySecurity; $acl.SetAccessRuleProtection($true,$false); $admin=New-Object System.Security.Principal.SecurityIdentifier('S-1-5-32-544'); $system=New-Object System.Security.Principal.SecurityIdentifier('S-1-5-18'); $acl.SetOwner($admin); foreach($sid in @($admin,$system)) { $rule=New-Object System.Security.AccessControl.FileSystemAccessRule($sid,'FullControl','ContainerInherit,ObjectInherit','None','Allow'); $acl.AddAccessRule($rule) }; Set-Acl -LiteralPath $directory -AclObject $acl }; $item=Get-Item -LiteralPath $directory; if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Recovery directory is a reparse point' }; $acl=Get-Acl -LiteralPath $directory; $owner=$acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value; if ($owner -notin @('S-1-5-32-544','S-1-5-18')) { throw 'Recovery directory has an untrusted owner' }; foreach($rule in $acl.Access) { $sid=$rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value; if ($rule.AccessControlType -eq 'Allow' -and $sid -notin @('S-1-5-32-544','S-1-5-18') -and ($rule.FileSystemRights -band [Security.AccessControl.FileSystemRights]::Write)) { throw 'Recovery directory permits untrusted writes' } } }; Join-Path $path 'tun'"#;
-        Ok(PathBuf::from(powershell(script)?))
-    }
-}
-
-pub(super) fn product_recovery_path() -> io::Result<PathBuf> {
-    #[cfg(unix)]
-    {
-        Ok(PathBuf::from(if cfg!(target_os = "macos") {
-            "/Library/Application Support/FlClash-Meow/tun"
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: security,
+            bInheritHandle: 0,
+        };
+        let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                GENERIC_WRITE,
+                FILE_SHARE_READ,
+                &attributes,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL,
+                std::ptr::null_mut(),
+            )
+        };
+        let error = if handle == INVALID_HANDLE_VALUE {
+            Some(io::Error::last_os_error())
         } else {
-            "/var/lib/flclash-meow/tun"
-        }))
-    }
-    #[cfg(windows)]
-    {
-        Ok(PathBuf::from(powershell(
-            "Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'FlClash-Meow/tun'",
-        )?))
-    }
-}
-
-pub(super) fn privileged() -> bool {
-    #[cfg(unix)]
-    {
-        unsafe { libc::geteuid() == 0 }
-    }
-    #[cfg(windows)]
-    {
-        #[link(name = "shell32")]
-        unsafe extern "system" {
-            fn IsUserAnAdmin() -> i32;
+            None
+        };
+        unsafe { LocalFree(security) };
+        match error {
+            Some(error) => Err(error),
+            None => Ok(unsafe { fs::File::from_raw_handle(handle) }),
         }
-        unsafe { IsUserAnAdmin() != 0 }
     }
 }
 
@@ -316,7 +335,7 @@ pub(super) fn owner_alive(pid: u32) -> io::Result<bool> {
 }
 
 #[cfg(windows)]
-pub(super) fn powershell(script: &str) -> io::Result<String> {
+pub fn powershell(script: &str) -> io::Result<String> {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;

@@ -1,9 +1,10 @@
 mod config;
 mod ipc;
+pub mod native;
 mod operations;
 pub mod protocol;
 mod runtime;
-pub use ipc::serve;
+pub use ipc::{serve, serve_until};
 
 use meow_api::log_stream::LogMessage;
 use protocol::{Request, Response, RpcError};
