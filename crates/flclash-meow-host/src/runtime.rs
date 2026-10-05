@@ -18,6 +18,9 @@ use std::{net::SocketAddr, sync::Arc};
 use tokio::{net::TcpListener, sync::broadcast, task::JoinSet};
 use tower::ServiceExt;
 
+#[path = "background.rs"]
+mod background;
+
 pub struct Runtime {
     pub state: Arc<AppState>,
     pub router: Router,
@@ -27,6 +30,7 @@ pub struct Runtime {
     failure: Arc<RwLock<Option<String>>>,
     binding: Option<meow_api::PreinstalledBinding>,
     pending_tun: Option<tokio::task::JoinHandle<()>>,
+    background: background::Background,
 }
 
 impl Runtime {
@@ -34,6 +38,7 @@ impl Runtime {
         mut config: Config,
         log_tx: broadcast::Sender<LogMessage>,
         binding: Option<meow_api::PreinstalledBinding>,
+        home: std::path::PathBuf,
     ) -> Self {
         let tunnel = Tunnel::new_with_slot(Arc::clone(&config.dns.resolver_slot));
         tunnel.set_dialer_registry(config.provider_dialer_registry.clone());
@@ -73,6 +78,7 @@ impl Runtime {
             failure: Arc::new(RwLock::new(None)),
             binding,
             pending_tun: None,
+            background: background::Background::new(home),
         }
     }
 
@@ -117,6 +123,10 @@ impl Runtime {
             let socket = TcpListener::bind(address)
                 .await
                 .map_err(|e| RpcError::new("listener_failed", format!("{}: {e}", listener.name)))?;
+            let address = socket
+                .local_addr()
+                .map_err(|e| RpcError::new("listener_failed", e.to_string()))?;
+            self.background.listeners.push(json!({"name":listener.name,"type":match listener.spec {ListenerSpec::Mixed=>"mixed",ListenerSpec::Http=>"http",_=>"socks5"},"address":address.to_string()}));
             bound.push((listener.clone(), socket));
         }
         let dns = if let Some(address) = self.config.dns.listen_addr {
@@ -125,14 +135,25 @@ impl Runtime {
                 .bind()
                 .await
                 .map_err(|e| RpcError::new("listener_failed", format!("dns.listen: {e}")))?;
+            let address = bound
+                .local_addr()
+                .map_err(|e| RpcError::new("listener_failed", e.to_string()))?;
+            self.background.dns = Some(address.to_string());
             Some((server, bound, address))
         } else {
             None
         };
         let api = if let Some(address) = self.config.api.external_controller {
-            Some(TcpListener::bind(address).await.map_err(|e| {
+            let socket = TcpListener::bind(address).await.map_err(|e| {
                 RpcError::new("listener_failed", format!("external-controller: {e}"))
-            })?)
+            })?;
+            self.background.controller = Some(
+                socket
+                    .local_addr()
+                    .map_err(|e| RpcError::new("listener_failed", e.to_string()))?
+                    .to_string(),
+            );
+            Some(socket)
         } else {
             None
         };
@@ -259,12 +280,14 @@ impl Runtime {
                 self.config.raw.proxy_groups.as_deref().unwrap_or(&[]),
             ));
         self.state.tunnel.spawn_background_tasks();
+        self.start_background_tasks();
         self.running = true;
         Ok(())
     }
 
     pub async fn stop(&mut self) -> Result<(), RpcError> {
         self.running = false;
+        self.background.clear();
         self.tasks.abort_all();
         while self.tasks.join_next().await.is_some() {}
         let dns = self.state.dns_server.write().take();
