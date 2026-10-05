@@ -94,12 +94,29 @@ impl Runtime {
         self.failure.read().clone()
     }
 
-    pub async fn start(&mut self) -> Result<(), RpcError> {
+    pub async fn start(
+        &mut self,
+        mut intent: tokio::sync::watch::Receiver<u64>,
+    ) -> Result<(), RpcError> {
         if self.running() {
             return Ok(());
         }
         self.stop().await?;
-        let outcome = self.start_inner().await;
+        let superseded = || {
+            RpcError::new(
+                "request_superseded",
+                "A later runtime intent superseded startup",
+            )
+        };
+        let outcome = if intent.has_changed().unwrap_or(true) {
+            Err(superseded())
+        } else {
+            tokio::select! {
+                biased;
+                _=intent.changed()=>Err(superseded()),
+                result=self.start_inner()=>result,
+            }
+        };
         if outcome.is_err() {
             self.stop().await?;
         }

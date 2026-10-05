@@ -277,7 +277,7 @@ impl Host {
                 state.cleanup_failure = Some("Startup cleanup is pending".into());
                 let runtime = state.runtime.as_mut().expect("configured runtime");
                 if self.wanted.load(Ordering::Acquire) {
-                    if let Err(error) = runtime.start().await {
+                    if let Err(error) = runtime.start(self.generation.subscribe()).await {
                         if error.code == "resources_release_unconfirmed" {
                             state.cleanup_failure = Some(error.message.clone());
                         } else {
@@ -480,7 +480,7 @@ impl Host {
                 .runtime
                 .as_mut()
                 .expect("staged runtime")
-                .start()
+                .start(generation)
                 .await
             {
                 if let Err(cleanup) = state.runtime.as_mut().expect("staged runtime").stop().await {
@@ -493,7 +493,7 @@ impl Host {
                 state.runtime = state.retired.take();
                 let rollback = if self.wanted.load(Ordering::Acquire) {
                     if let Some(old) = state.runtime.as_mut() {
-                        old.start().await.map(|()| true)
+                        old.start(self.generation.subscribe()).await.map(|()| true)
                     } else {
                         Ok(false)
                     }
@@ -503,7 +503,14 @@ impl Host {
                 state.cleanup_failure = rollback.as_ref().err().and_then(|error| {
                     (error.code == "resources_release_unconfirmed").then(|| error.message.clone())
                 });
-                let mut error = RpcError::new("config_apply_failed", error.message);
+                let code = if state.cleanup_failure.is_some() {
+                    "resources_release_unconfirmed"
+                } else if error.code == "request_superseded" {
+                    "request_superseded"
+                } else {
+                    "config_apply_failed"
+                };
+                let mut error = RpcError::new(code, error.message);
                 error.details = json!({"restored":matches!(rollback,Ok(true)),"rollbackError":rollback.err().map(|e|e.message)});
                 return Err(error);
             }
