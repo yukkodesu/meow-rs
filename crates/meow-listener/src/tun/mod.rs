@@ -63,6 +63,8 @@ mod outbound_binding;
 pub mod ownership;
 mod route;
 mod udp;
+#[cfg(target_os = "windows")]
+mod windows_device;
 #[cfg(any(test, target_os = "windows"))]
 mod wintun;
 
@@ -558,11 +560,13 @@ impl TunListener {
             );
 
             let created = {
-                let mut builder = tun_rs::DeviceBuilder::new()
-                    .mtu(mtu)
-                    .ipv4(addr, prefix, None);
-                if let Some(v6) = inet6 {
-                    builder = builder.ipv6(v6.addr(), v6.prefix_len());
+                let mut builder = tun_rs::DeviceBuilder::new().mtu(mtu);
+                #[cfg(not(target_os = "windows"))]
+                {
+                    builder = builder.ipv4(addr, prefix, None);
+                    if let Some(v6) = inet6 {
+                        builder = builder.ipv6(v6.addr(), v6.prefix_len());
+                    }
                 }
                 if let Some(n) = &name_for_closure {
                     builder = builder.name(n);
@@ -573,7 +577,17 @@ impl TunListener {
                 {
                     builder = builder.wintun_file(wintun_file).wintun_log(true);
                 }
-                builder.build_async()
+                let created = builder.build_async();
+                #[cfg(target_os = "windows")]
+                let created = created.and_then(|device| {
+                    windows_device::configure_addresses(
+                        device.if_index()?,
+                        Ipv4Net::new(addr, prefix).map_err(io::Error::other)?,
+                        inet6,
+                    )?;
+                    Ok(device)
+                });
+                created
             };
             match created {
                 Ok(d) => {

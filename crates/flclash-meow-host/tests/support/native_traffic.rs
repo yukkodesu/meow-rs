@@ -1,3 +1,4 @@
+use anyhow::Context;
 use serde_json::{json, Value};
 use std::{net::Ipv4Addr, time::Duration};
 use tokio::{
@@ -78,7 +79,9 @@ impl Fixtures {
             b"\x12\x34\x01\0\0\x01\0\0\0\0\0\0\x06native\x07example\0\0\x01\0\x01".to_vec();
         let index = request.len() - 3;
         request[index] = record_type;
-        peer.send_to(&request, "198.18.0.1:53").await?;
+        peer.send_to(&request, "198.18.0.1:53")
+            .await
+            .context("Sending DNS probe through TUN")?;
         let mut answer = [0u8; 512];
         let (length, _) =
             tokio::time::timeout(Duration::from_secs(5), peer.recv_from(&mut answer)).await??;
@@ -90,7 +93,7 @@ impl Fixtures {
     }
 
     pub async fn verify(&self) -> anyhow::Result<Value> {
-        let answer = self.dns_query(1).await?;
+        let answer = self.dns_query(1).await.context("TUN fake-IP DNS probe")?;
         anyhow::ensure!(answer[7] > 0 && answer.len() >= 16, "No fake-IP answer");
         let ip = Ipv4Addr::from(<[u8; 4]>::try_from(&answer[answer.len() - 4..])?);
         anyhow::ensure!(
