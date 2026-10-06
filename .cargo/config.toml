@@ -1,0 +1,2 @@
+[env]
+CMAKE_TOOLCHAIN_FILE_aarch64_pc_windows_msvc = { value = "cmake/windows-arm64-msvc.cmake", relative = true }
