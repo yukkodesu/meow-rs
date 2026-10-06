@@ -472,12 +472,14 @@ impl ProxyProvider {
     /// a 200-OK garbage body can't durably poison the fallback cache.
     async fn fetch_source(&self) -> Result<String, String> {
         match &self.vehicle {
-            Vehicle::File(path) => tokio::fs::read_to_string(path).await.map_err(|e| {
-                format!(
-                    "proxy-provider '{}': failed to read {:?}: {}",
-                    self.name, path, e
-                )
-            }),
+            Vehicle::File(path) => meow_common::managed_files::read_to_string_async(path)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "proxy-provider '{}': failed to read {:?}: {}",
+                        self.name, path, e
+                    )
+                }),
             Vehicle::Http { url, .. } => {
                 let download_proxy = match crate::internal_http::resolve_download_proxy(
                     &self.dialer_registry,
@@ -544,6 +546,15 @@ impl ProxyProvider {
         else {
             return;
         };
+        if let Some(result) =
+            meow_common::managed_files::write_atomic_if_managed_async(cache_path, text.as_bytes())
+                .await
+        {
+            if let Err(error) = result {
+                warn!("proxy-provider cache: {}: {error}", cache_path.display());
+            }
+            return;
+        }
         if let Some(parent) = cache_path.parent() {
             let _ = tokio::fs::create_dir_all(parent).await;
         }
@@ -948,7 +959,14 @@ pub async fn load_proxy_providers(
         match ProxyProvider::new(name, raw, cache_dir, ipv6, strict, dialer_registry.clone()) {
             Ok(provider) => {
                 let provider = Arc::new(provider);
-                if crate::is_offline_validate() {
+                if crate::validation::is_active() {
+                    let (content, _) =
+                        provider.fetch_content().await.map_err(anyhow::Error::msg)?;
+                    provider
+                        .ingest(content, false)
+                        .await
+                        .map_err(anyhow::Error::msg)?;
+                } else if crate::is_offline_validate() {
                     // Offline validation (`meow -t`): the provider parsed and
                     // its path/filters are structurally valid — that is what a
                     // config test checks. Skip the network fetch so a slow or
@@ -1037,7 +1055,7 @@ async fn read_cache(path: Option<&Path>, name: &str) -> Result<String, String> {
             "proxy-provider '{name}': fetch failed and no on-disk cache is configured"
         ));
     };
-    tokio::fs::read_to_string(path)
+    meow_common::managed_files::read_to_string_async(path)
         .await
         .map_err(|e| format!("proxy-provider '{name}': no cache at {path:?}: {e}"))
 }

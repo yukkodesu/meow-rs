@@ -67,12 +67,16 @@ pub async fn parse_dns(
     let use_hosts = dns.use_hosts.unwrap_or(true);
     let use_system_hosts = dns.use_system_hosts.unwrap_or(true);
 
-    let main_urls = parse_nameserver_entries(dns.nameserver.as_deref().unwrap_or(&[]))?;
-    let fallback_urls = parse_nameserver_entries(dns.fallback.as_deref().unwrap_or(&[]))?;
+    let main_urls = parse_nameserver_entries(dns.nameserver.as_deref().unwrap_or(&[]))
+        .map_err(|e| anyhow::anyhow!("dns.nameserver: {e}"))?;
+    let fallback_urls = parse_nameserver_entries(dns.fallback.as_deref().unwrap_or(&[]))
+        .map_err(|e| anyhow::anyhow!("dns.fallback: {e}"))?;
     let default_ns_urls =
-        parse_nameserver_entries(dns.default_nameserver.as_deref().unwrap_or(&[]))?;
+        parse_nameserver_entries(dns.default_nameserver.as_deref().unwrap_or(&[]))
+            .map_err(|e| anyhow::anyhow!("dns.default-nameserver: {e}"))?;
     let proxy_ns_urls =
-        parse_nameserver_entries(dns.proxy_server_nameserver.as_deref().unwrap_or(&[]))?;
+        parse_nameserver_entries(dns.proxy_server_nameserver.as_deref().unwrap_or(&[]))
+            .map_err(|e| anyhow::anyhow!("dns.proxy-server-nameserver: {e}"))?;
 
     let mode = match dns.enhanced_mode.as_deref() {
         Some("fake-ip") => DnsMode::FakeIp,
@@ -217,11 +221,11 @@ async fn install_fakeip(
         .fake_ip_range
         .as_deref()
         .unwrap_or(DEFAULT_FAKE_IP_RANGE_V4);
-    let prefix: ipnet::IpNet = range_str
-        .parse()
-        .map_err(|e| anyhow::anyhow!("dns.fake-ip-range '{range_str}' is not a valid CIDR: {e}"))?;
+    let prefix: ipnet::IpNet = range_str.parse().map_err(|e| {
+        anyhow::anyhow!("dns.fake-ip-range: '{range_str}' is not a valid CIDR: {e}")
+    })?;
 
-    let persist = dns.store_fake_ip.unwrap_or(false);
+    let persist = dns.store_fake_ip.unwrap_or(false) && !crate::validation::is_active();
 
     // The file this generation would bind to, when persisting. Computed
     // before the reuse check so the check can compare store identity, not
@@ -860,7 +864,8 @@ fn build_fallback_filter(
     let geoip_reader = if geoip {
         let mmdb_path =
             explicit_mmdb_path.map_or_else(crate::default_geoip_path, std::path::PathBuf::from);
-        match std::fs::read(&mmdb_path)
+        match crate::validation::resource(&mmdb_path)
+            .map_or_else(|| meow_common::managed_files::read(&mmdb_path), Ok)
             .map_err(|e| format!("{e}"))
             .and_then(|b| maxminddb::Reader::from_source(b).map_err(|e| format!("{e}")))
         {

@@ -213,7 +213,7 @@ impl RuleProvider {
                 )
                 .await?
             }
-            ProviderType::File => tokio::fs::read(&self.vehicle)
+            ProviderType::File => meow_common::managed_files::read_async(Path::new(&self.vehicle))
                 .await
                 .with_context(|| format!("reading provider file {}", self.vehicle))?,
             ProviderType::Inline => return Ok(()),
@@ -402,7 +402,7 @@ fn read_payload_bytes(
         "file" => {
             let path = resolve_path(cfg, cache_dir, name, false)?
                 .ok_or_else(|| anyhow!("file provider '{name}' requires a 'path'"))?;
-            let bytes = std::fs::read(&path)
+            let bytes = meow_common::managed_files::read(&path)
                 .with_context(|| format!("reading provider file {}", path.display()))?;
             Ok(Some(bytes))
         }
@@ -736,7 +736,7 @@ fn load_file(
     let bytes_owned;
     let bytes: &[u8] = match prefetched {
         Some(b) => b,
-        None => match std::fs::read(&path) {
+        None => match meow_common::managed_files::read(&path) {
             Ok(b) => {
                 bytes_owned = b;
                 &bytes_owned
@@ -1088,11 +1088,18 @@ fn fetch_http_blocking_with_cache(
     prefer_cache: bool,
     headers: &[(String, String)],
 ) -> Result<Vec<u8>> {
+    if crate::validation::is_active() {
+        return fetch_http_blocking(url, proxy, headers).or_else(|fetch_error| match cache_path {
+            Some(path) if path.exists() => meow_common::managed_files::read(path)
+                .with_context(|| format!("reading cached provider {}", path.display())),
+            _ => Err(fetch_error),
+        });
+    }
     if prefer_cache || crate::is_offline_validate() {
         if let Some(path) = cache_path {
             if path.exists() {
                 debug!("rule-provider cache hit: {}", path.display());
-                return std::fs::read(path)
+                return meow_common::managed_files::read(path)
                     .with_context(|| format!("reading cached provider {}", path.display()));
             }
         }
@@ -1117,7 +1124,7 @@ fn fetch_http_blocking_with_cache(
                         fetch_err,
                         path.display()
                     );
-                    return std::fs::read(path)
+                    return meow_common::managed_files::read(path)
                         .with_context(|| format!("reading cached provider {}", path.display()));
                 }
             }
@@ -1171,6 +1178,13 @@ pub(crate) async fn fetch_http_async(
 }
 
 fn write_cache(path: &Path, bytes: &[u8]) -> bool {
+    if let Some(result) = meow_common::managed_files::write_atomic_if_managed(path, bytes) {
+        if let Err(error) = result {
+            warn!("rule-provider cache: {}: {error}", path.display());
+            return false;
+        }
+        return true;
+    }
     if let Some(parent) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             warn!(

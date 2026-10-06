@@ -16,6 +16,13 @@ the canonical, in-repo source a release is cut from.
   `x86_64-unknown-linux-musl` binary, so `luci-app-meow` can be installed on
   x86 OpenWrt.
 
+### Changed
+
+- Linux TUN DNS restoration now restores only captured state still owned by
+  the terminating runtime. Legacy `.meow-backup` recovery and the fallback
+  that overwrote DNS with public resolvers have been removed. Conflicting or
+  unconfirmed restoration fails closed and reports an error instead.
+
 ## [0.22.0] - 2026-10-03
 
 ### Added

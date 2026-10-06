@@ -136,9 +136,8 @@ fn sweep_idle_sessions(table: &NatTable, idle: Duration) -> usize {
 }
 
 /// Spawn the background sweeper that evicts UDP NAT sessions idle for more
-/// than `idle`. Scans every `interval`. The task exits when the caller drops
-/// the returned `JoinHandle`'s aborter (or the last Arc to the table is
-/// dropped and the weak upgrade fails).
+/// than `idle`. Scans every `interval`. The caller must abort and await the
+/// returned task, or drop the last Arc to the table so the weak upgrade fails.
 pub fn spawn_nat_sweeper(
     nat_table: &NatTable,
     idle: Duration,

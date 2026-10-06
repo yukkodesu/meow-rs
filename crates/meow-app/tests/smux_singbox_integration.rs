@@ -204,7 +204,7 @@ rules:
     let tunnel = meow_tunnel::Tunnel::new(std::sync::Arc::clone(&config.dns.resolver));
     tunnel.set_mode(config.general.mode);
     tunnel.update_routing(config.proxies, config.rules, config.dialer_registry);
-    tunnel.spawn_background_tasks();
+    let _nat_sweeper = tunnel.spawn_background_tasks();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
