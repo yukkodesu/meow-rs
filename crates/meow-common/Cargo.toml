@@ -52,6 +52,14 @@ windows-sys = { version = "0.60", features = [
     "Win32_Networking_WinSock",
     "Win32_System_Threading",
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_SystemServices",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Wdk_Storage_FileSystem",
+    "Wdk_Foundation",
 ] }
 
 # Unix-only dev deps used by socket_protect's `#[cfg(all(test, unix))]` tests:

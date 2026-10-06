@@ -116,6 +116,18 @@ pub async fn download_and_replace(
     dest: &Path,
     proxy: Option<&Arc<dyn Proxy>>,
 ) -> Result<(), anyhow::Error> {
+    if meow_common::managed_files::is_managed() {
+        let bytes = internal_http::fetch(url, proxy, &[]).await?;
+        meow_common::managed_files::write_atomic_if_managed_async(dest, &bytes)
+            .await
+            .expect("The product home policy cannot be removed")?;
+        info!(
+            "auto-update: {} updated ({} bytes)",
+            dest.display(),
+            bytes.len()
+        );
+        return Ok(());
+    }
     // Unique scratch, not `with_extension("tmp")` — same-stem targets
     // (`Country.mmdb`/`Country.yaml` → `Country.tmp`) and concurrent
     // downloaders (auto-update vs rebuild-time `ensure_geodata`) must not

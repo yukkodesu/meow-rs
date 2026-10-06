@@ -60,8 +60,11 @@ mod dns;
 #[cfg(target_os = "windows")]
 mod local_dns;
 mod outbound_binding;
+pub mod ownership;
 mod route;
 mod udp;
+#[cfg(target_os = "windows")]
+mod windows_device;
 #[cfg(any(test, target_os = "windows"))]
 mod wintun;
 
@@ -103,6 +106,72 @@ use route::RouteGuard;
 
 pub use outbound_binding::OutboundBinding;
 
+#[derive(Debug, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum RecoveryState {
+    #[default]
+    Clean,
+    Recovered,
+    NeedsPrivilege,
+    Failed,
+}
+
+#[derive(Debug, Default, serde::Serialize)]
+pub struct RecoveryStatus {
+    pub state: RecoveryState,
+    pub details: Vec<String>,
+}
+
+pub fn recover_tun_resources(path: &std::path::Path) -> io::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+        Ok(_) => {}
+    }
+    let _lease = ownership::JournalLease::acquire(path)?;
+    recover_tun_resources_locked(path)
+}
+
+fn recover_tun_resources_locked(path: &std::path::Path) -> io::Result<bool> {
+    let outcome = (|| {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+            Ok(_) => {}
+        }
+        let mut found = false;
+        let mut errors = Vec::new();
+        for (name, recover) in [
+            (
+                "dns.json",
+                dns::recover as fn(&std::path::Path) -> io::Result<()>,
+            ),
+            (
+                "routes.json",
+                route::recover as fn(&std::path::Path) -> io::Result<()>,
+            ),
+        ] {
+            let journal = path.join(name);
+            match std::fs::symlink_metadata(&journal) {
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+                Ok(_) => {
+                    found = true;
+                }
+            }
+            if let Err(error) = recover(&journal) {
+                errors.push(format!("{name}: {error}"));
+            }
+        }
+        if errors.is_empty() {
+            Ok(found)
+        } else {
+            Err(io::Error::other(errors.join("; ")))
+        }
+    })();
+    outcome
+}
+
 /// Process-global serialization point for lwIP generations (issue #514).
 /// `NetStack::new` must not run while a previous core is still tearing
 /// down — aborted pump tasks are reaped asynchronously, so the core's
@@ -117,6 +186,21 @@ static PREVIOUS_CORE: tokio::sync::Mutex<Option<tokio::sync::watch::Receiver<boo
 /// wedged-core scenario; proceeding past it logs loudly because two live
 /// cores risk corrupting lwIP's process-global pcb lists.
 const PREVIOUS_CORE_TEARDOWN_WAIT: Duration = Duration::from_secs(10);
+
+pub async fn await_tun_core_teardown() -> io::Result<()> {
+    if let Some(mut done) = PREVIOUS_CORE.lock().await.clone() {
+        timeout(PREVIOUS_CORE_TEARDOWN_WAIT, done.wait_for(|done| *done))
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "TUN core teardown was not confirmed",
+                )
+            })?
+            .map_err(|_| io::Error::other("TUN core exited without confirming teardown"))?;
+    }
+    Ok(())
+}
 
 /// Tracks all child `JoinHandle`s spawned by a TUN listener. On drop,
 /// aborts every tracked task — this guarantees the TUN device and all its
@@ -320,6 +404,7 @@ struct TunDevice {
     #[allow(dead_code)]
     iface_guard: Option<OutboundBinding>,
     pub(super) device: tun_rs::AsyncDevice,
+    _resources: meow_tunnel::tunnel::TunResourceLease,
 }
 
 pub struct TunListener {
@@ -335,6 +420,7 @@ pub struct TunListener {
     /// Global-scope binding installed by the caller before this listener
     /// was built (see [`Self::with_outbound_binding`]).
     outbound_binding: Option<OutboundBinding>,
+    recovery_directory: Option<std::path::PathBuf>,
 }
 
 impl TunListener {
@@ -345,6 +431,7 @@ impl TunListener {
             name,
             ready: None,
             outbound_binding: None,
+            recovery_directory: None,
         }
     }
 
@@ -372,7 +459,21 @@ impl TunListener {
         self
     }
 
+    pub fn with_recovery_directory(mut self, directory: std::path::PathBuf) -> Self {
+        self.recovery_directory = Some(directory);
+        self
+    }
+
     pub async fn run(mut self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let _resources = self.tunnel.retain_tun_resources();
+        let _lease = self
+            .recovery_directory
+            .as_ref()
+            .map(|directory| ownership::JournalLease::acquire(directory))
+            .transpose()?;
+        if let Some(directory) = self.recovery_directory.as_ref() {
+            recover_tun_resources_locked(directory)?;
+        }
         // Extract the readiness sender into a notifier so setup failures
         // reach the caller immediately: an `Err` from `run_inner` sends
         // `TunReady::Failed` with the real error message, and if the future
@@ -382,6 +483,9 @@ impl TunListener {
         let preinstalled = self.outbound_binding.take();
         let result = self.run_inner(&mut notifier, preinstalled).await;
         if let Err(e) = &result {
+            if e.to_string().contains("resources_release_unconfirmed") {
+                self.tunnel.report_tun_cleanup_failure(e.to_string());
+            }
             if let Some(n) = notifier.take() {
                 n.fail(e.to_string());
             }
@@ -394,6 +498,7 @@ impl TunListener {
         notifier: &mut Option<ReadyNotifier>,
         preinstalled: Option<OutboundBinding>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.tunnel.tun_cleanup_result()?;
         let t0 = Instant::now();
         info!("TUN listener '{}' starting...", self.name);
 
@@ -414,8 +519,7 @@ impl TunListener {
         // Windows after an unclean shutdown).  After the first retry fails,
         // we also rotate the TUN IP to work around address conflicts.
         //
-        // Each attempt runs on a blocking thread; the outer caller's
-        // TUN_STARTUP_TIMEOUT guards the overall time spent here.
+        // Native setup stays in this task so cancellation cannot detach resource changes.
         const MAX_TUN_RETRIES: u32 = 5;
         const TUN_CREATE_RETRY_DELAY: Duration = Duration::from_millis(500);
         let base_addr = cfg.inet4_address.addr();
@@ -455,12 +559,14 @@ impl TunListener {
                 MAX_TUN_RETRIES,
             );
 
-            match tokio::task::spawn_blocking(move || {
-                let mut builder = tun_rs::DeviceBuilder::new()
-                    .mtu(mtu)
-                    .ipv4(addr, prefix, None);
-                if let Some(v6) = inet6 {
-                    builder = builder.ipv6(v6.addr(), v6.prefix_len());
+            let created = {
+                let mut builder = tun_rs::DeviceBuilder::new().mtu(mtu);
+                #[cfg(not(target_os = "windows"))]
+                {
+                    builder = builder.ipv4(addr, prefix, None);
+                    if let Some(v6) = inet6 {
+                        builder = builder.ipv6(v6.addr(), v6.prefix_len());
+                    }
                 }
                 if let Some(n) = &name_for_closure {
                     builder = builder.name(n);
@@ -471,11 +577,20 @@ impl TunListener {
                 {
                     builder = builder.wintun_file(wintun_file).wintun_log(true);
                 }
-                builder.build_async()
-            })
-            .await
-            {
-                Ok(Ok(d)) => {
+                let created = builder.build_async();
+                #[cfg(target_os = "windows")]
+                let created = created.and_then(|device| {
+                    windows_device::configure_addresses(
+                        device.if_index()?,
+                        Ipv4Net::new(addr, prefix).map_err(io::Error::other)?,
+                        inet6,
+                    )?;
+                    Ok(device)
+                });
+                created
+            };
+            match created {
+                Ok(d) => {
                     dev_name = d
                         .name()
                         .unwrap_or_else(|_| name.clone().unwrap_or_default());
@@ -483,16 +598,9 @@ impl TunListener {
                     device = Some(d);
                     break;
                 }
-                Ok(Err(e)) => {
+                Err(e) => {
                     warn!("failed to create TUN device '{}': {e}", display_name);
                     last_err = Some(e.to_string());
-                }
-                Err(join_err) => {
-                    warn!(
-                        "spawn_blocking for TUN device '{}' panicked: {join_err}",
-                        display_name
-                    );
-                    last_err = Some(join_err.to_string());
                 }
             }
 
@@ -539,9 +647,7 @@ impl TunListener {
 
         // auto-route: install the scope's routes (see module docs).
         //
-        // RouteManager::add() calls into OS routing APIs that may block
-        // (PowerShell on Windows), so it runs on a blocking thread. The
-        // outer TUN_STARTUP_TIMEOUT guards the overall startup.
+
         let route_nets: Option<Vec<ipnet::IpNet>> = if cfg.auto_route {
             match cfg.route_scope {
                 // Split defaults: two /1s (macOS: eight routes that avoid
@@ -562,24 +668,25 @@ impl TunListener {
                 Some(nets) => {
                     let t_route = Instant::now();
 
-                    let result =
-                        tokio::task::spawn_blocking(move || RouteGuard::setup(if_index, &nets))
-                            .await;
+                    let result = RouteGuard::setup(
+                        if_index,
+                        &dev_name,
+                        &nets,
+                        self.recovery_directory
+                            .as_ref()
+                            .map(|directory| directory.join("routes.json")),
+                        self.tunnel.clone(),
+                    );
 
                     match result {
-                        Ok(Ok(g)) => {
+                        Ok(g) => {
                             let route_ms = t_route.elapsed().as_secs_f64() * 1000.0;
                             info!("auto-route installed in {route_ms:.0}ms");
                             Some(g)
                         }
-                        Ok(Err(e)) => {
+                        Err(e) => {
                             return Err(Box::new(io::Error::other(format!(
                                 "failed to install auto-route: {e}"
-                            ))));
-                        }
-                        Err(join_err) => {
-                            return Err(Box::new(io::Error::other(format!(
-                                "auto-route spawn_blocking panicked: {join_err}"
                             ))));
                         }
                     }
@@ -608,6 +715,7 @@ impl TunListener {
             route_guard,
             iface_guard,
             device,
+            _resources: self.tunnel.retain_tun_resources(),
         });
 
         // Windows: bind the loopback DNS sockets *before* DnsGuard repoints
@@ -628,21 +736,19 @@ impl TunListener {
 
         // When dns-hijack is on and we're in fake-IP mode, point the OS
         // resolver at the loopback DNS server.  The backup + set calls into
-        // PowerShell (Get-DnsClientServerAddress / Set-DnsClientServerAddress)
-        // which can take tens of seconds on Windows, so run them on a
-        // blocking thread. The outer TUN_STARTUP_TIMEOUT guards the overall
-        // startup.
+        // the OS DNS API while keeping the mutation owned by this task.
         let _dns_guard = if cfg.dns_hijack && cfg.auto_route {
             let t_dns = Instant::now();
             let guard = match self.tunnel.resolver().fake_ip_v4_gateway() {
                 Some(gateway) => {
-                    let g = tokio::task::spawn_blocking(move || dns::DnsGuard::setup(gateway))
-                        .await
-                        .map_err(|join_err| {
-                            Box::new(io::Error::other(format!(
-                                "dns-guard spawn_blocking panicked: {join_err}"
-                            )))
-                        })?;
+                    let g = Some(dns::DnsGuard::setup(
+                        gateway,
+                        if_index,
+                        self.recovery_directory
+                            .as_ref()
+                            .map(|directory| directory.join("dns.json")),
+                        self.tunnel.clone(),
+                    )?);
                     let dns_ms = t_dns.elapsed().as_secs_f64() * 1000.0;
                     let dns_active = g.is_some();
                     info!("dns-guard setup took {dns_ms:.0}ms (active: {dns_active})");
@@ -680,7 +786,13 @@ impl TunListener {
                 // Teardown signalled, or the core's sender vanished entirely
                 // (core panicked/exited without signalling — nothing left to
                 // wait on either way).
-                Ok(_) => {}
+                Ok(Ok(_)) => {}
+                Ok(Err(_)) => {
+                    return Err(io::Error::other(
+                        "Previous lwIP core exited without confirming teardown",
+                    )
+                    .into())
+                }
                 // A still-living predecessor owns the process-global pcb
                 // lists `NetStack::new` is about to overwrite — proceeding
                 // is a data race on C state, not a recoverable wait. Fail

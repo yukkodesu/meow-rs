@@ -1132,7 +1132,7 @@ async fn run(
     tunnel.set_dialer_registry(config.provider_dialer_registry.clone());
     tunnel.set_mode(config.general.mode);
     tunnel.update_routing(config.proxies, config.rules, config.dialer_registry);
-    tunnel.spawn_background_tasks();
+    let _nat_sweeper = tunnel.spawn_background_tasks();
 
     // Spawn periodic health checks for fallback / url-test proxy groups.
     // The supervisor lives on the tunnel so config reloads can reconcile
@@ -1681,7 +1681,9 @@ async fn publish_tun_if_committed(
             "TUN startup finished after the committed config \
              moved on — tearing down the stale device"
         );
-        tunnel.teardown_tun_handle(tun_handle).await;
+        if let Err(error) = tunnel.teardown_tun_handle(tun_handle).await {
+            warn!("Stale TUN resources release unconfirmed: {error}");
+        }
         return;
     }
     if tun_handle.task.is_finished() {
@@ -1691,11 +1693,16 @@ async fn publish_tun_if_committed(
         // same-config PUT would early-return on the unchanged diff —
         // treat it exactly like a startup failure.
         warn!("TUN listener reported ready then exited before its handle was stored");
-        tunnel.teardown_tun_handle(tun_handle).await;
+        if let Err(error) = tunnel.teardown_tun_handle(tun_handle).await {
+            warn!("Exited TUN resources release unconfirmed: {error}");
+        }
         rollback_committed_enable(tunnel, raw_config);
         return;
     }
-    tunnel.set_tun_handle(tun_handle).await;
+    if let Err(error) = tunnel.set_tun_handle(tun_handle).await {
+        warn!("TUN resources release unconfirmed: {error}");
+        rollback_committed_enable(tunnel, raw_config);
+    }
 }
 
 #[cfg(test)]
@@ -1929,7 +1936,7 @@ mod tests {
             publish_tun_if_committed(&tunnel, &raw, &startup, handle).await;
             assert!(tunnel.has_tun(), "matching committed config → stored");
 
-            tunnel.stop_tun().await;
+            tunnel.stop_tun().await.unwrap();
         }
 
         #[tokio::test]
@@ -1965,7 +1972,7 @@ mod tests {
             // without evicting the stored successor.
             let raw = raw_with_tun("tun:\n  enable: true\n  mtu: 9000\n");
             let (successor, mut keep_rx) = pending_handle();
-            tunnel.set_tun_handle(successor).await;
+            tunnel.set_tun_handle(successor).await.unwrap();
 
             let startup = meow_config::TunConfig {
                 enable: true,
@@ -1991,7 +1998,7 @@ mod tests {
                 "stored successor must not be torn down"
             );
 
-            tunnel.stop_tun().await;
+            tunnel.stop_tun().await.unwrap();
         }
 
         #[tokio::test]
@@ -2030,7 +2037,7 @@ mod tests {
             let tunnel = test_tunnel();
             let raw = raw_with_tun("tun:\n  enable: true\n  mtu: 9000\n");
             let (successor, _keep) = pending_handle();
-            tunnel.set_tun_handle(successor).await;
+            tunnel.set_tun_handle(successor).await.unwrap();
 
             rollback_tun_enable(&tunnel, &raw).await;
             assert!(
@@ -2039,7 +2046,7 @@ mod tests {
             );
             assert!(tunnel.has_tun());
 
-            tunnel.stop_tun().await;
+            tunnel.stop_tun().await.unwrap();
         }
 
         /// A handle whose task already exited — the listener sent Ready
@@ -2088,7 +2095,7 @@ mod tests {
             let raw = raw_with_tun("tun:\n  enable: true\n  mtu: 1500\n");
             let startup = startup_tun(&raw);
             let (successor, mut keep_rx) = pending_handle();
-            tunnel.set_tun_handle(successor).await;
+            tunnel.set_tun_handle(successor).await.unwrap();
 
             let stale = finished_handle();
             for _ in 0..100 {
@@ -2112,7 +2119,7 @@ mod tests {
                 "sibling's committed enable stays true"
             );
 
-            tunnel.stop_tun().await;
+            tunnel.stop_tun().await.unwrap();
         }
     }
 

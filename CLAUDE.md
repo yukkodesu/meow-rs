@@ -156,7 +156,9 @@ cargo test -p meow-proxy --features anytls --lib
 # lands `main` red.
 cargo test --lib --bin meow \
   --test socks5_udp_user \
-  --test common_test --test dns_cache_test --test config_test \
+  --test common_test --test managed_files --test managed_files_cli \
+  --test dns_cache_test --test config_test --test offline_validation \
+  --test background_lifetime --test tun_cleanup_contract \
   --test tun_config_test --test dialer_proxy_group \
   --test statistics_test --test rules_test --test api_test \
   --test raii_guard_test --test http_connection_close \
@@ -177,6 +179,14 @@ cargo test --lib --bin meow \
 # TUN-reconcile tests actually execute — the unified invocation above
 # compiles them out via feature unification.
 cargo test -p meow-api --test api_test
+
+# Synthetic subprocess/ownership fixtures require listener-tun but never
+# alter native DNS, routes or devices. Ignored privileged fixtures are not
+# part of this bar.
+cargo test -p meow-listener --features listener-tun --test native_command --test native_ownership
+
+# On Windows, replace the Unix-only managed_files target above with:
+cargo test -p meow-common --test managed_files_windows
 ```
 
 `smux_singbox_integration` runs the full stack (config → mixed listener →

@@ -228,9 +228,14 @@ jobs:
         run: |
           cargo nextest run --lib --bin meow \
             --test common_test \
+            --test managed_files \
+            --test managed_files_cli \
             --test socks5_udp_user \
             --test dns_cache_test \
             --test config_test \
+            --test offline_validation \
+            --test background_lifetime \
+            --test tun_cleanup_contract \
             --test tun_config_test \
             --test dialer_proxy_group \
             --test statistics_test \
@@ -267,6 +272,9 @@ jobs:
       # unified invocation above feature unification compiles them out.
       - name: API tests without listener-tun (TUN reconcile)
         run: cargo nextest run -p meow-api --test api_test --retries 2 --no-fail-fast
+
+      - name: Native command and ownership contracts (listener-tun)
+        run: cargo nextest run -p meow-listener --features listener-tun --test native_command --test native_ownership --retries 2 --no-fail-fast
 
       - name: UDP routing regression (SOCKS5, Shadowsocks, TUN)
         run: cargo nextest run -p meow-listener --all-features --lib udp_port_53 --retries 2 --no-fail-fast
@@ -448,7 +456,12 @@ jobs:
         run: |
           cargo nextest run --lib --bin meow \
             --test common_test \
+            --test managed_files_windows \
+            --test managed_files_cli \
             --test config_test \
+            --test offline_validation \
+            --test background_lifetime \
+            --test tun_cleanup_contract \
             --test rules_test \
             --test api_test \
             --test trojan_integration \
@@ -457,14 +470,11 @@ jobs:
             --test ws_test \
             --test crate_publish_metadata_test --retries 2 --no-fail-fast
 
-      # TUN inbound tests: `listener-tun` is not a default feature, so the
-      # workspace --lib leg above never compiles or runs the tun module's
-      # tests. This leg covers the Windows-only DnsGuard logic (backup
-      # filtering, batched restore-script generation, and a read-only smoke
-      # test of the real PowerShell/registry backup path) plus the
-      # platform-neutral TUN routing-loop guard.
+      # Select listener-tun explicitly rather than relying on workspace
+      # feature unification. Synthetic command/ownership contracts do not change
+      # native DNS or routes; privileged acceptance remains opt-in.
       - name: meow-listener TUN tests (listener-tun)
-        run: cargo nextest run -p meow-listener --features listener-tun --lib --retries 2 --no-fail-fast
+        run: cargo nextest run -p meow-listener --features listener-tun --lib --test native_command --test native_ownership --retries 2 --no-fail-fast
 
   macos:
     runs-on: macos-latest
@@ -489,7 +499,12 @@ jobs:
         run: |
           cargo nextest run --lib --bin meow \
             --test common_test \
+            --test managed_files \
+            --test managed_files_cli \
             --test config_test \
+            --test offline_validation \
+            --test background_lifetime \
+            --test tun_cleanup_contract \
             --test rules_test \
             --test api_test \
             --test trojan_integration \
@@ -502,7 +517,7 @@ jobs:
       # module's tests — notably the macOS regression guard that an unset
       # `tun.device` never invents a name (tun-rs rejects non-`utunN`).
       - name: meow-listener TUN tests (listener-tun)
-        run: cargo nextest run -p meow-listener --features listener-tun --lib --retries 2 --no-fail-fast
+        run: cargo nextest run -p meow-listener --features listener-tun --lib --test native_command --test native_ownership --retries 2 --no-fail-fast
 
   tproxy:
     runs-on: ubuntu-latest

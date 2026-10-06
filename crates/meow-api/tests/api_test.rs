@@ -20,6 +20,39 @@ fn test_log_tx() -> broadcast::Sender<meow_api::log_stream::LogMessage> {
     broadcast::channel(16).0
 }
 
+#[tokio::test]
+async fn put_configs_reports_unconfirmed_tun_cleanup_instead_of_success() {
+    use base64::Engine as _;
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_yaml::from_str("enable: true").unwrap());
+    let state = test_state(raw);
+    state
+        .tunnel
+        .report_tun_cleanup_failure("fixture DNS restoration denied".into());
+    let payload = base64::engine::general_purpose::STANDARD
+        .encode("mode: rule\ntun: { enable: false }\nrules: ['MATCH,DIRECT']\n");
+    let response = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload":payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(std::str::from_utf8(&body)
+        .unwrap()
+        .contains("resources release unconfirmed"));
+    assert!(state.tunnel.stop_tun().await.is_err());
+    assert!(!state.tunnel.has_tun());
+}
+
 fn test_raw_config() -> RawConfig {
     RawConfig {
         mixed_port: Some(7890),
@@ -5153,7 +5186,7 @@ async fn put_configs_tun_param_change_reconciles_running_listener() {
     raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
-    state.tunnel.set_tun_handle(handle).await;
+    state.tunnel.set_tun_handle(handle).await.unwrap();
     assert!(state.tunnel.has_tun());
 
     let yaml = concat!(
@@ -5215,7 +5248,7 @@ async fn put_configs_tun_unchanged_does_not_reconcile() {
     raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
-    state.tunnel.set_tun_handle(handle).await;
+    state.tunnel.set_tun_handle(handle).await.unwrap();
 
     let yaml = concat!(
         "mode: rule\n",
@@ -5268,7 +5301,7 @@ async fn put_configs_invalid_tun_rejected_before_commit() {
     raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
-    state.tunnel.set_tun_handle(handle).await;
+    state.tunnel.set_tun_handle(handle).await.unwrap();
 
     // mtu below the IPv6 floor (1280) fails `parse_tun_config`.
     let yaml = concat!(
@@ -5374,7 +5407,7 @@ async fn put_configs_force_invalid_tun_commits_and_rolls_back() {
     raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
-    state.tunnel.set_tun_handle(handle).await;
+    state.tunnel.set_tun_handle(handle).await.unwrap();
 
     let yaml = concat!(
         "mode: rule\n",
@@ -5422,7 +5455,7 @@ async fn put_configs_max_connections_change_reconciles_tun() {
     raw.tun = Some(serde_yaml::from_str("enable: true").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
-    state.tunnel.set_tun_handle(handle).await;
+    state.tunnel.set_tun_handle(handle).await.unwrap();
 
     let yaml = concat!(
         "mode: rule\n",
@@ -5519,7 +5552,7 @@ async fn put_configs_tun_enable_off_stops_listener() {
     raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
-    state.tunnel.set_tun_handle(handle).await;
+    state.tunnel.set_tun_handle(handle).await.unwrap();
 
     let yaml = "mode: rule\nrules:\n  - MATCH,DIRECT\n";
     let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
@@ -5608,7 +5641,7 @@ async fn put_configs_tun_disabled_param_change_no_restart() {
     raw.tun = Some(serde_yaml::from_str("enable: false\nmtu: 1500").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
-    state.tunnel.set_tun_handle(handle).await;
+    state.tunnel.set_tun_handle(handle).await.unwrap();
 
     let yaml = concat!(
         "mode: rule\n",
@@ -5654,7 +5687,7 @@ async fn put_configs_tun_fake_ip_change_restarts_listener() {
     raw.tun = Some(serde_yaml::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
     let (handle, stopped) = fake_tun_handle();
-    state.tunnel.set_tun_handle(handle).await;
+    state.tunnel.set_tun_handle(handle).await.unwrap();
 
     let yaml = concat!(
         "mode: rule\n",

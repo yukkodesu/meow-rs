@@ -17,6 +17,16 @@ use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+pub type ProxyConfigValidator =
+    fn(&HashMap<String, serde_yaml::Value>) -> std::result::Result<(), String>;
+static PROXY_CONFIG_VALIDATOR: std::sync::OnceLock<ProxyConfigValidator> =
+    std::sync::OnceLock::new();
+
+/// Embedders may reject ignored fields before static or provider nodes are materialized.
+pub fn install_proxy_config_validator(validator: ProxyConfigValidator) {
+    let _ = PROXY_CONFIG_VALIDATOR.set(validator);
+}
+
 fn required_port(
     config: &HashMap<String, serde_yaml::Value>,
     context: &str,
@@ -176,6 +186,9 @@ pub fn parse_proxy_with_dialer(
     dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
     ipv6: bool,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
+    if let Some(validate) = PROXY_CONFIG_VALIDATOR.get() {
+        validate(config)?;
+    }
     let name = config
         .get("name")
         .and_then(|v| v.as_str())

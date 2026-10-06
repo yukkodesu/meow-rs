@@ -56,6 +56,8 @@ ipnet = { workspace = true, optional = true }
 shadowsocks = { workspace = true, optional = true }
 meow-transport = { workspace = true, optional = true }
 parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 meow-config = { workspace = true }
@@ -68,6 +70,21 @@ shadowsocks = { workspace = true }
 async-trait = { workspace = true }
 tracing-subscriber = { workspace = true }
 smol_str = { workspace = true }
+tempfile.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
 
 [[test]]
 name = "ss_listener_integration"

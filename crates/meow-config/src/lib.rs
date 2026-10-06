@@ -23,6 +23,8 @@ pub mod rule_parser;
 pub mod rule_provider;
 pub mod rule_provider_refresh;
 mod safe_path;
+mod validation;
+pub use validation::validate_config;
 pub mod sub_rules_parser;
 pub mod subscription;
 
@@ -48,7 +50,11 @@ where
     R: Send + 'static,
 {
     let dispatch = tracing::dispatcher::get_default(Clone::clone);
-    tokio::task::spawn_blocking(move || tracing::dispatcher::with_default(&dispatch, f)).await
+    let context = validation::current();
+    tokio::task::spawn_blocking(move || {
+        validation::with_blocking_scope(context, || tracing::dispatcher::with_default(&dispatch, f))
+    })
+    .await
 }
 
 pub(crate) fn parse_optional_socket_addr(
@@ -63,7 +69,7 @@ pub(crate) fn parse_optional_socket_addr(
             normalized
                 .parse()
                 .map(Some)
-                .map_err(|e| anyhow::anyhow!("invalid {field} socket address '{value}': {e}"))
+                .map_err(|e| anyhow::anyhow!("{field}: invalid socket address '{value}': {e}"))
         }
         _ => Ok(None),
     }
@@ -591,7 +597,7 @@ pub fn set_offline_validate(on: bool) {
 /// True when config loading must skip remote proxy-provider fetches (see
 /// [`set_offline_validate`]).
 pub fn is_offline_validate() -> bool {
-    OFFLINE_VALIDATE.load(std::sync::atomic::Ordering::Relaxed)
+    validation::is_active() || OFFLINE_VALIDATE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Process policy for hosts accepting configurations from delegated users.
@@ -618,7 +624,7 @@ pub async fn load_config(path: &str) -> Result<Config, anyhow::Error> {
 /// document (the TUN global-route interface binding, issue #695) before
 /// the build's provider / geodata / ECH fetches open their first socket.
 pub async fn load_raw_config(path: &str) -> Result<raw::RawConfig, anyhow::Error> {
-    let bytes = tokio::fs::read(path)
+    let bytes = meow_common::managed_files::read_async(Path::new(path))
         .await
         .map_err(|e| anyhow::anyhow!("failed to read config file {path}: {e}"))?;
     // Strip an optional UTF-8 BOM, which YAML 1.2 permits but some
@@ -720,6 +726,9 @@ pub(crate) fn unique_scratch_path(path: &Path) -> PathBuf {
 /// land an older document's rename last (issue #543).
 pub fn save_raw_config(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
     let yaml = serde_yaml::to_string(raw)?;
+    if meow_common::managed_files::is_managed() {
+        return save_managed_config(path, yaml.as_bytes()).map_err(Into::into);
+    }
     // Scratch files orphaned by a crash between create and rename
     // accumulate forever otherwise — sweep stale ones on each save
     // (issue #621).
@@ -753,6 +762,12 @@ pub fn save_raw_config(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::E
 /// the `CONFIG_MUTATION` lane so file order follows commit order (issue #543).
 pub async fn save_raw_config_async(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
     let yaml = serde_yaml::to_string(raw)?;
+    if meow_common::managed_files::is_managed() {
+        let path = path.to_owned();
+        return tokio::task::spawn_blocking(move || save_managed_config(&path, yaml.as_bytes()))
+            .await?
+            .map_err(Into::into);
+    }
     // Same crash-leftover sweep as the sync variant (issue #621), off the
     // async worker since it walks the config dir.
     {
@@ -781,6 +796,20 @@ pub async fn save_raw_config_async(path: &str, raw: &raw::RawConfig) -> Result<(
     }
     info!("Config saved to {}", path);
     Ok(())
+}
+
+fn save_managed_config(path: &str, yaml: &[u8]) -> std::io::Result<()> {
+    match meow_common::managed_files::read(Path::new(path)) {
+        Ok(previous) => meow_common::managed_files::write_atomic_if_managed(
+            Path::new(&format!("{path}.bak")),
+            &previous,
+        )
+        .expect("The product home policy cannot be removed")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    meow_common::managed_files::write_atomic_if_managed(Path::new(path), yaml)
+        .expect("The product home policy cannot be removed")
 }
 
 #[cfg(test)]
@@ -2907,26 +2936,32 @@ async fn ensure_geodata(
     geo: &GeoDataConfig,
     scan_lines: &[String],
     prefetch: Option<&PrefetchProxies>,
-) {
-    if is_offline_validate() {
-        // Validate local databases when present; missing databases use empty
-        // indexes for structural checks and are fetched only at real startup.
-        return;
+) -> anyhow::Result<()> {
+    if is_offline_validate() && !validation::is_active() {
+        return Ok(());
     }
     let downloads = missing_geodata_downloads(raw, geo, scan_lines);
     if downloads.is_empty() {
-        return;
+        return Ok(());
     }
 
     let proxy: Option<Arc<dyn Proxy>> =
         prefetch.and_then(|m| internal_http::first_named_proxy(raw.proxies.as_deref(), &m.map));
 
     for (url, dest) in downloads {
+        if validation::is_active() {
+            let bytes = internal_http::fetch(url, proxy.as_ref(), &[])
+                .await
+                .map_err(|error| anyhow::anyhow!("geodata: {url}: {error}"))?;
+            validation::insert_resource(dest, bytes);
+            continue;
+        }
         info!("geodata: downloading {} to {}", url, dest.display());
         if let Err(e) = geodata::download_and_replace(url, &dest, proxy.as_ref()).await {
             warn!("geodata: failed to download {} — {}", url, e);
         }
     }
+    Ok(())
 }
 
 /// Parse geodata paths from `raw.geodata` and build a `ParserContext` that
@@ -2982,15 +3017,18 @@ fn build_parser_context_at(
 
     let geoip_trigger = lines.iter().find(|l| line_references_geoip(l));
     let geoip = match geoip_trigger {
-        Some(_) if is_offline_validate() && !geoip_path.exists() => {
+        Some(_)
+            if is_offline_validate()
+                && !geoip_path.exists()
+                && !validation::has_resource(geoip_path) =>
+        {
             Some(Arc::new(meow_rules::country_index::CountryIndex::default()))
         }
         Some(trigger) => {
-            let reader = load_mmdb_mmap(geoip_path, "GeoIP", trigger)?;
+            let reader = load_mmdb(geoip_path, "GeoIP", trigger)?;
             let allowed = collect_geoip_countries(&lines);
             let index = meow_rules::country_index::CountryIndex::build(&reader, &allowed)
                 .map_err(|e| anyhow::anyhow!("failed to build GeoIP country index: {e}"))?;
-            // reader is mmap-backed — pages are returned to the OS on drop.
             drop(reader);
             Some(Arc::new(index))
         }
@@ -2999,11 +3037,15 @@ fn build_parser_context_at(
 
     let asn_trigger = lines.iter().find(|l| line_references_asn(l));
     let asn = match asn_trigger {
-        Some(_) if is_offline_validate() && !asn_path.exists() => {
+        Some(_)
+            if is_offline_validate()
+                && !asn_path.exists()
+                && !validation::has_resource(asn_path) =>
+        {
             Some(Arc::new(meow_rules::asn_index::AsnIndex::default()))
         }
         Some(trigger) => {
-            let reader = load_mmdb_mmap(asn_path, "GeoLite2-ASN", trigger)?;
+            let reader = load_mmdb(asn_path, "GeoLite2-ASN", trigger)?;
             let allowed = collect_asn_numbers(&lines);
             let index = meow_rules::asn_index::AsnIndex::build(&reader, &allowed)
                 .map_err(|e| anyhow::anyhow!("failed to build ASN index: {e}"))?;
@@ -3022,11 +3064,21 @@ fn build_parser_context_at(
             "Loading geosite database for {} referenced categories",
             allowed.len()
         );
-        let loaded = meow_rules::geosite::discover_and_load_at(
-            geosite_explicit,
-            geosite_candidates,
-            Some(&allowed),
+        let memory = validation::resource(
+            &geosite_explicit.map_or_else(default_geosite_path, Path::to_path_buf),
         );
+        let loaded = if let Some(bytes) = memory {
+            Some(Arc::new(
+                meow_rules::geosite::GeositeDB::from_bytes(&bytes, Some(&allowed))
+                    .map_err(|error| anyhow::anyhow!("geodata.geosite-path: {error}"))?,
+            ))
+        } else {
+            meow_rules::geosite::discover_and_load_at(
+                geosite_explicit,
+                geosite_candidates,
+                Some(&allowed),
+            )
+        };
         if loaded.is_some() {
             info!("Loaded geosite database");
         }
@@ -3042,16 +3094,39 @@ fn build_parser_context_at(
     })
 }
 
-/// Memory-map an MMDB file. The OS reclaims pages immediately on drop,
-/// unlike `Vec<u8>` where the allocator retains the freed block.
-fn load_mmdb_mmap(
+enum MmdbSource {
+    Mapped(maxminddb::Mmap),
+    Managed(Vec<u8>),
+}
+
+impl AsRef<[u8]> for MmdbSource {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Mapped(source) => source,
+            Self::Managed(bytes) => bytes,
+        }
+    }
+}
+
+fn load_mmdb(
     path: &Path,
     kind: &str,
     trigger: &str,
-) -> Result<maxminddb::Reader<maxminddb::Mmap>, anyhow::Error> {
-    // Safety: the file is read-only and not modified during the reader's
-    // lifetime (dropped before the function returns to the caller).
-    let reader = unsafe { maxminddb::Reader::open_mmap(path) }.map_err(|e| {
+) -> Result<maxminddb::Reader<MmdbSource>, anyhow::Error> {
+    let reader = (|| -> anyhow::Result<_> {
+        let source = if let Some(bytes) = validation::resource(path) {
+            MmdbSource::Managed(bytes)
+        } else if meow_common::managed_files::is_managed() {
+            // Caller-owned files can change concurrently; copying avoids mmap UB.
+            MmdbSource::Managed(meow_common::managed_files::read(path)?)
+        } else {
+            let file = meow_common::managed_files::open(path)?;
+            // CLI resources remain unchanged during this short-lived reader.
+            MmdbSource::Mapped(unsafe { maxminddb::Mmap::map(&file) }?)
+        };
+        Ok(maxminddb::Reader::from_source(source)?)
+    })()
+    .map_err(|e| {
         anyhow::anyhow!(
             "Failed to load {} database at {}\n  required by rule: {}\n  underlying error: {}",
             kind,
@@ -3060,7 +3135,7 @@ fn load_mmdb_mmap(
             e
         )
     })?;
-    info!("Loaded {} database from {} (mmap)", kind, path.display());
+    info!("Loaded {} database from {}", kind, path.display());
     Ok(reader)
 }
 
@@ -3539,6 +3614,8 @@ fn build_named_listeners(
                    listen: &str,
                    max_connections: usize|
      -> Result<(), anyhow::Error> {
+        resolve_listener_bind(listen, Some(port))
+            .map_err(|e| anyhow::anyhow!("bind-address: {e}"))?;
         // Port 0 is "OS assigns an ephemeral port" — each such listener binds
         // a distinct port at runtime, so they are not duplicates of each other.
         if port != 0 {
@@ -3633,7 +3710,7 @@ fn build_named_listeners(
     }
 
     // Explicit `listeners:` entries
-    for raw_l in raw.listeners.as_deref().unwrap_or(&[]) {
+    for (index, raw_l) in raw.listeners.as_deref().unwrap_or(&[]).iter().enumerate() {
         let spec = parse_listener_spec(raw_l, global_tproxy_sni)?;
         if raw_l.firewall.is_some() && !matches!(spec, ListenerSpec::TProxy { .. }) {
             warn!(
@@ -3683,7 +3760,8 @@ fn build_named_listeners(
                 default_bind
             }
         });
-        let (listen, port) = resolve_listener_bind(listen_raw, raw_l.port)?;
+        let (listen, port) = resolve_listener_bind(listen_raw, raw_l.port)
+            .map_err(|e| anyhow::anyhow!("listeners[{index}].listen: {e}"))?;
         // `parse_listener_spec` returns a placeholder for `Shadowsocks`; fold
         // the real cipher/password/udp/simple-obfs fields in here. TProxy's
         // `sni` is already resolved inside `parse_listener_spec`.
@@ -3816,8 +3894,10 @@ pub async fn build_config(
     // Missing/unreadable files yield an empty store — no fatal errors.
     let cache_dir_buf = cache_dir.map(Path::to_path_buf);
     let selector_store = match cache_dir_buf.as_ref() {
-        Some(d) => Some(open_selector_store_async(d.join("selector-cache.json")).await?),
-        None => None,
+        Some(d) if !validation::is_active() => {
+            Some(open_selector_store_async(d.join("selector-cache.json")).await?)
+        }
+        _ => None,
     };
 
     // One shared pre-registry proxy layer for the two startup fetches that
@@ -3848,7 +3928,7 @@ pub async fn build_config(
     // must happen before building the parser context, which hard-errors on
     // missing GeoIP/ASN files.
     let geo_scan_lines = collect_geo_scan_lines(&raw, &provider_payloads);
-    ensure_geodata(&raw, &geodata, &geo_scan_lines, prefetch_proxies.as_deref()).await;
+    ensure_geodata(&raw, &geodata, &geo_scan_lines, prefetch_proxies.as_deref()).await?;
     drop(geo_scan_lines);
     drop(prefetch_proxies);
 
