@@ -10,9 +10,9 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
-- **DIRECT UDP loopback**: use loopback sockets for local destinations so
-  physical-interface binding in global TUN mode does not reject Windows
-  or macOS loopback traffic. Preserve mapped IPv4 targets and IPv6 scope IDs.
+- **Outbound interface binding**: exempt loopback and multicast destinations
+  on Linux, macOS and Windows, using the actual UDP peer rather than the local
+  wildcard address. Preserve mapped IPv4 targets and IPv6 scope IDs.
 
 ### Added
 

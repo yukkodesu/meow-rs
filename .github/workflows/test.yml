@@ -226,6 +226,8 @@ jobs:
           # And for kcptun_e2e's all-real-peer suite.
           KCPTUN_SERVER_BIN: ${{ runner.temp }}/kcptun-server
         run: |
+          export MEOW_TEST_OUTBOUND_INTERFACE="$(ip -4 route get 1.1.1.1 | awk '{for (i=1;i<NF;i++) if ($i=="dev") {print $(i+1); exit}}')"
+          test -n "$MEOW_TEST_OUTBOUND_INTERFACE"
           cargo nextest run --lib --bin meow \
             --test direct_udp_binding \
             --test common_test \
@@ -447,6 +449,8 @@ jobs:
       - name: Unit + integration tests (windows)
         shell: bash
         run: |
+          export MEOW_TEST_OUTBOUND_INTERFACE="$(powershell.exe -NoProfile -Command '(Find-NetRoute -RemoteIPAddress 1.1.1.1 | Select-Object -First 1).InterfaceAlias' | tr -d '\r')"
+          test -n "$MEOW_TEST_OUTBOUND_INTERFACE"
           cargo nextest run --lib --bin meow \
             --test direct_udp_binding \
             --test common_test \
@@ -489,6 +493,8 @@ jobs:
 
       - name: Core smoke tests
         run: |
+          export MEOW_TEST_OUTBOUND_INTERFACE="$(route -n get default | awk '/interface:/ {print $2}')"
+          test -n "$MEOW_TEST_OUTBOUND_INTERFACE"
           cargo nextest run --lib --bin meow \
             --test direct_udp_binding \
             --test common_test \
