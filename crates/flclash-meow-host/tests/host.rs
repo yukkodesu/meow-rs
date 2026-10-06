@@ -14,6 +14,59 @@ async fn call(host: &Host, method: &str, arguments: Value) -> Value {
 }
 
 #[tokio::test]
+async fn system_dns_compatibility_covers_upstream_lists_and_policies() {
+    let host = Host::new();
+    let home = tempfile::tempdir().unwrap();
+    call(&host, "initClash", json!({"home-dir":home.path()})).await;
+    for field in [
+        "nameserver",
+        "fallback",
+        "default-nameserver",
+        "proxy-server-nameserver",
+        "nameserver-policy",
+    ] {
+        let servers = "[' system ', 'system://', 'system://#DIRECT', 'dhcp://system', '127.0.0.1']";
+        let value = if field == "nameserver-policy" {
+            format!("{{example.com: {servers}}}")
+        } else {
+            servers.into()
+        };
+        let yaml = format!("dns:\n  enable: true\n  {field}: {value}\nrules: ['MATCH,DIRECT']\n");
+        let checked = call(&host, "checkConfig", json!(yaml)).await;
+        assert_eq!(checked["valid"], true, "{field}: {checked}");
+        let path = if field == "nameserver-policy" {
+            "dns.nameserver-policy.example.com".into()
+        } else {
+            format!("dns.{field}")
+        };
+        assert!(
+            checked["diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["severity"] == "warning" && d["path"] == path),
+            "{field}: {checked}"
+        );
+        let strict = call(&host, "checkConfig", json!(format!("strict: true\n{yaml}"))).await;
+        assert_eq!(strict["valid"], false, "{field}: {strict}");
+        let only_system = yaml.replace(
+            &value,
+            if field == "nameserver-policy" {
+                "{example.com: 'system://'}"
+            } else {
+                "['system://']"
+            },
+        );
+        let rejected = call(&host, "checkConfig", json!(only_system)).await;
+        assert_eq!(rejected["valid"], false, "{field}: {rejected}");
+        let invalid = yaml.replace("127.0.0.1", "quic://127.0.0.1");
+        let rejected = call(&host, "checkConfig", json!(invalid)).await;
+        assert_eq!(rejected["valid"], false, "{field}: {rejected}");
+    }
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn compatibility_warnings_preserve_native_configuration_policy() {
     let host = Host::new();
     let home = tempfile::tempdir().unwrap();

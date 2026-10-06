@@ -7,5 +7,5 @@ pub(super) fn apply(raw: &mut RawConfig, diagnostics: &mut Vec<Diagnostic>) {
     if raw.strict.unwrap_or(false) {
         return;
     }
-    dns::filter_system_bootstrap(raw, diagnostics);
+    dns::filter_system_nameservers(raw, diagnostics);
 }
