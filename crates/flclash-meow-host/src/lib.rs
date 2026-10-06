@@ -496,6 +496,9 @@ impl Host {
             .ok_or_else(|| RpcError::new("not_initialized", "Host is not initialized"))?;
         let (raw, check) = config::parse(content, Some(home))?;
         ensure_valid(&check)?;
+        for diagnostic in check.diagnostics.iter().filter(|d| d.severity == "warning") {
+            tracing::warn!("{}: {}", diagnostic.path, diagnostic.reason);
+        }
         let binding = meow_api::preinstall_global_route_binding(&raw);
         let mut generation = self.generation.subscribe();
         let config = tokio::select! {

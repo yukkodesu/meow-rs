@@ -14,6 +14,29 @@ async fn call(host: &Host, method: &str, arguments: Value) -> Value {
 }
 
 #[tokio::test]
+async fn compatibility_warnings_preserve_native_configuration_policy() {
+    let host = Host::new();
+    let home = tempfile::tempdir().unwrap();
+    call(&host, "initClash", json!({"home-dir": home.path()})).await;
+    for yaml in [
+        "dns: {cache-algorithm: arc, ipv6: true, prefer-h3: true}\netag-support: true\nprofile: {store-selected: true}\nproxies: [{name: edge, type: http, server: localhost, port: 80, client-fingerprint: chrome}]\nrules: ['MATCH,DIRECT']\n",
+        "proxies: [{name: unavailable, type: tuic}]\nrules: ['MATCH,DIRECT']\n",
+        "strict: true\nproxies: [{name: unavailable, type: tuic}]\nrules: ['MATCH,DIRECT']\n",
+        "tun: {mtu: 1200}\nrules: ['MATCH,DIRECT']\n",
+    ] {
+        let raw = meow_config::parse_raw_yaml(yaml).unwrap();
+        let native = meow_config::validate_config(raw, Some(home.path())).await;
+        let checked = call(&host, "checkConfig", json!(yaml)).await;
+        assert_eq!(checked["valid"], native.is_ok(), "{yaml}: {checked}; native: {native:?}");
+        if native.is_ok() {
+            tokio::fs::write(home.path().join("config.yaml"), yaml).await.unwrap();
+            call(&host, "setupConfig", Value::Null).await;
+        }
+    }
+    host.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn fresh_http_providers_are_checked_before_application_without_persisting_payloads() {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -31,18 +54,26 @@ async fn fresh_http_providers_are_checked_before_application_without_persisting_
                 let body = if request.starts_with("GET /rules") {
                     "payload: ['example.com']\n"
                 } else if request.starts_with("GET /unsafe") {
-                    "proxies: [{name: edge, type: http, server: localhost, port: 80, tls: 'true'}]\n"
+                    "proxies: [{name: edge, type: http, server: localhost, port: invalid}]\n"
                 } else {
                     "proxies: [{name: edge, type: http, server: localhost, port: 80}]\n"
                 };
-                peer.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+                peer.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
             });
         }
     });
     let host = Host::new();
     let home = tempfile::tempdir().unwrap();
     call(&host, "initClash", json!({"home-dir":home.path()})).await;
-    let profile = format!("proxy-providers: {{remote: {{type: http, url: 'http://{address}/nodes', path: nodes.yaml}}}}\nproxy-groups: [{{name: route, type: select, use: [remote]}}]\nrule-providers: {{domains: {{type: http, url: 'http://{address}/rules', path: domains.yaml, behavior: domain}}}}\nrules: ['RULE-SET,domains,DIRECT', 'MATCH,route']\n");
+    let profile = format!("strict: true\nproxy-providers: {{remote: {{type: http, url: 'http://{address}/nodes', path: nodes.yaml}}}}\nproxy-groups: [{{name: route, type: select, use: [remote]}}]\nrule-providers: {{domains: {{type: http, url: 'http://{address}/rules', path: domains.yaml, behavior: domain}}}}\nrules: ['RULE-SET,domains,DIRECT', 'MATCH,route']\n");
     let checked = call(&host, "checkConfig", json!(profile)).await;
     assert_eq!(checked["valid"], true, "{checked}");
     assert!(!home.path().join("nodes.yaml").exists());
@@ -51,9 +82,9 @@ async fn fresh_http_providers_are_checked_before_application_without_persisting_
     let rejected = call(&host, "checkConfig", json!(unsafe_profile)).await;
     assert_eq!(
         rejected["valid"], false,
-        "Downloaded TLS loss must block before apply"
+        "Native provider parse errors must block under explicit strict mode"
     );
-    assert!(rejected["diagnostics"].to_string().contains("tls"));
+    assert!(rejected["diagnostics"].to_string().contains("port"));
     assert!(!home.path().join("nodes.yaml").exists());
     tokio::fs::write(home.path().join("config.yaml"), profile)
         .await
@@ -67,79 +98,39 @@ async fn fresh_http_providers_are_checked_before_application_without_persisting_
 }
 
 #[tokio::test]
-async fn plugin_options_cannot_disable_tls_or_discard_requested_fields() {
+async fn plugin_file_reads_remain_confined_before_engine_parsing() {
     let host = Host::new();
     let home = tempfile::tempdir().unwrap();
     call(&host, "initClash", json!({"home-dir": home.path()})).await;
-    let node = "name: edge, type: ss, server: localhost, port: 443, cipher: aes-128-gcm, password: fixture, plugin: v2ray-plugin";
-    for (options, field) in [
-        ("{tls: typo}", "tls"),
-        ("{tls: {enabled: true}}", "tls"),
-        ("'tls=typo'", "tls"),
-        ("'tls.enabled=true'", "tls.enabled"),
-        ("'unknown=true'", "unknown"),
-        ("{headers: {Authorization: 123}}", "headers.Authorization"),
-        ("'header=malformed'", "header"),
-        ("{host: [localhost]}", "host"),
-        ("{tls: null}", "tls"),
-        ("{host: 'localhost;tls=false'}", "host"),
-        ("{headers: {'Bad:Name': fixture}}", "headers.Bad:Name"),
+    for opts in [
+        "{certificate: /outside/cert.pem}",
+        "'certificate=/outside/cert.pem'",
     ] {
-        let proxy = format!("{{{node}, plugin-opts: {options}}}");
-        let yaml = format!("proxies: [{proxy}]\nrules: ['MATCH,DIRECT']\n");
-        let checked = call(&host, "checkConfig", json!(yaml)).await;
-        assert_eq!(checked["valid"], false, "{options}: {checked}");
-        assert!(
-            checked["diagnostics"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|d| d["path"] == format!("proxies[0].plugin-opts.{field}")),
-            "{checked}"
-        );
-        tokio::fs::write(
-            home.path().join("nodes.yaml"),
-            format!("proxies: [{proxy}]\n"),
-        )
-        .await
-        .unwrap();
-        tokio::fs::write(home.path().join("config.yaml"), "proxy-providers: {local: {type: file, path: nodes.yaml}}\nproxy-groups: [{name: route, type: select, use: [local]}]\nrules: ['MATCH,route']\n").await.unwrap();
-        let rejected = host
+        let yaml = format!("proxies: [{{name: edge, type: ss, server: localhost, port: 443, cipher: aes-128-gcm, password: fixture, plugin: gost-plugin, plugin-opts: {opts}}}]\nrules: ['MATCH,DIRECT']\n");
+        let check = call(&host, "checkConfig", json!(yaml)).await;
+        assert_eq!(check["valid"], false);
+        assert!(check["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["path"] == "proxies[0].plugin-opts.certificate"));
+        tokio::fs::write(home.path().join("nodes.yaml"), &yaml)
+            .await
+            .unwrap();
+        tokio::fs::write(home.path().join("config.yaml"), "strict: true\nproxy-providers: {local: {type: file, path: nodes.yaml}}\nproxy-groups: [{name: route, type: select, use: [local]}]\nrules: ['MATCH,route']\n").await.unwrap();
+        let result = host
             .call(Request {
                 id: None,
                 method: "setupConfig".into(),
                 arguments: Value::Null,
             })
             .await;
-        assert!(rejected
+        assert!(result
             .error
-            .expect("Provider options must block application")
+            .unwrap()
             .message
-            .contains(&format!("plugin-opts.{field}")));
-        assert_eq!(
-            call(&host, "getRuntimeState", Value::Null).await["configured"],
-            false
-        );
+            .contains("plugin-opts.certificate"));
     }
-    for options in ["{mode: websocket, tls: true, skip-cert-verify: false, mux: 'off', headers: {Authorization: fixture}}", "'mode=ws;tls;skip-cert-verify=off;mux=0;header=Authorization:fixture'", "{tls: '', mux: '', skip-cert-verify: ''}"] {
-        let yaml = format!("proxies: [{{{node}, plugin-opts: {options}}}]\nrules: ['MATCH,DIRECT']\n");
-        let checked = call(&host, "checkConfig", json!(yaml)).await;
-        assert_eq!(checked["valid"], true, "{options}: {checked}");
-        tokio::fs::write(home.path().join("config.yaml"), yaml).await.unwrap();
-        call(&host, "setupConfig", Value::Null).await;
-    }
-    let certificate = call(&host, "checkConfig", json!("proxies: [{name: edge, type: ss, server: localhost, port: 443, cipher: aes-128-gcm, password: fixture, plugin: gost-plugin, plugin-opts: {certificate: /outside/cert.pem}}]\nrules: ['MATCH,DIRECT']\n")).await;
-    assert!(certificate["diagnostics"].as_array().unwrap().iter().any(|d| d["path"] == "proxies[0].plugin-opts.certificate"), "File-backed plugin certificates must be rejected before unconfined engine reads: {certificate}");
-    let ignored = call(&host, "checkConfig", json!("proxies: [{name: edge, type: ss, server: localhost, port: 443, cipher: aes-128-gcm, password: fixture, plugin-opts: {tls: true}}]\nrules: ['MATCH,DIRECT']\n")).await;
-    assert_eq!(
-        ignored["valid"], false,
-        "Options without a plugin must not disappear: {ignored}"
-    );
-    let bad_cipher = call(&host, "checkConfig", json!("proxies: [{name: edge, type: ss, server: localhost, port: 443, cipher: aes-128-gcm, password: fixture, plugin: kcptun, plugin-opts: {crypt: typo}}]\nrules: ['MATCH,DIRECT']\n")).await;
-    assert_eq!(
-        bad_cipher["valid"], false,
-        "Unknown plugin ciphers must not become AES: {bad_cipher}"
-    );
     host.shutdown().await.unwrap();
 }
 
@@ -161,88 +152,6 @@ async fn successful_configuration_does_not_announce_an_unnamed_provider() {
         "Configuration completion is not a provider refresh"
     );
     call(&host, "shutdown", Value::Null).await;
-}
-
-#[tokio::test]
-async fn authentication_tls_and_nested_values_are_never_silently_dropped() {
-    let host = Host::new();
-    let home = tempfile::tempdir().unwrap();
-    call(
-        &host,
-        "initClash",
-        json!({"home-dir":home.path(),"version":1}),
-    )
-    .await;
-    for (options, field) in [
-        ("username: 123, password: 456", "username"),
-        ("tls: 'true'", "tls"),
-        ("skip-cert-verify: 'false'", "skip-cert-verify"),
-        ("headers: {Authorization: 123}", "headers.Authorization"),
-    ] {
-        for protocol in ["http", "socks5"] {
-            if protocol == "socks5" && field.starts_with("headers") {
-                continue;
-            }
-            let node = format!(
-                "{{name: edge, type: {protocol}, server: localhost, port: 443, {options}}}"
-            );
-            let yaml = format!("proxies: [{node}]\nrules: ['MATCH,DIRECT']\n");
-            let check = call(&host, "checkConfig", json!(yaml)).await;
-            assert_eq!(check["valid"], false, "{yaml}");
-            assert!(
-                check["diagnostics"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|d| d["path"] == format!("proxies[0].{field}")),
-                "{check}"
-            );
-            tokio::fs::write(
-                home.path().join("nodes.yaml"),
-                format!("proxies: [{node}]\n"),
-            )
-            .await
-            .unwrap();
-            tokio::fs::write(home.path().join("config.yaml"), "proxy-providers: {local: {type: file, path: nodes.yaml}}\nproxy-groups: [{name: route, type: select, use: [local]}]\nrules: ['MATCH,route']\n").await.unwrap();
-            let result = host
-                .call(Request {
-                    id: None,
-                    method: "setupConfig".into(),
-                    arguments: Value::Null,
-                })
-                .await;
-            assert!(result
-                .error
-                .expect("Provider values must also block application")
-                .message
-                .contains(field));
-            assert_eq!(
-                call(&host, "getRuntimeState", Value::Null).await["configured"],
-                false
-            );
-        }
-    }
-    for (options, field) in [
-        (
-            "ws-opts: {headers: {Authorization: 123}}",
-            "ws-opts.headers.Authorization",
-        ),
-        ("alpn: [h2, 123]", "alpn"),
-        ("ech-opts: {enable: 'true'}", "ech-opts.enable"),
-    ] {
-        let yaml = format!("proxies: [{{name: edge, type: vless, server: localhost, port: 443, uuid: '00000000-0000-0000-0000-000000000000', {options}}}]\nrules: ['MATCH,DIRECT']\n");
-        let check = call(&host, "checkConfig", json!(yaml)).await;
-        assert_eq!(check["valid"], false);
-        assert!(
-            check["diagnostics"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|d| d["path"] == format!("proxies[0].{field}")),
-            "{check}"
-        );
-    }
-    host.shutdown().await.unwrap();
 }
 
 #[tokio::test]
@@ -293,7 +202,7 @@ async fn initialization_is_idle_and_unknown_nested_options_are_reported() {
                 && diagnostic["reason"].as_str().unwrap().contains("::1")
         }));
     let check = call(&host, "checkConfig", json!("proxies:\n  - name: edge\n    type: vless\n    server: localhost\n    port: 443\n    uuid: 00000000-0000-0000-0000-000000000000\n    reality-opts:\n      public-key: x\n      imaginary: true\n")).await;
-    assert_eq!(check["valid"], false);
+    assert_eq!(check["valid"], true);
     assert!(check["diagnostics"]
         .as_array()
         .unwrap()
@@ -302,18 +211,6 @@ async fn initialization_is_idle_and_unknown_nested_options_are_reported() {
     let malformed = call(&host, "checkConfig", json!("proxies: [")).await;
     assert_eq!(malformed["valid"], false);
     assert_eq!(malformed["diagnostics"][0]["path"], "$");
-    let alias = call(
-        &host,
-        "checkConfig",
-        json!("proxies: [{name: local, type: direct}]\nrules: ['MATCH,local']\n"),
-    )
-    .await;
-    assert_eq!(alias["valid"], false);
-    assert!(alias["diagnostics"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|d| d["path"] == "proxies[0].name"));
     let outside = tempfile::tempdir().unwrap();
     for path in [
         "../../../config.yaml".to_string(),
@@ -513,7 +410,7 @@ async fn proxy_ready_transfers_data_and_failed_replacement_restores_the_previous
 }
 
 #[tokio::test]
-async fn provider_nodes_with_unknown_options_cannot_silently_enter_a_group() {
+async fn provider_nodes_with_unknown_options_follow_native_policy() {
     let host = Host::new();
     let dir = tempfile::tempdir().unwrap();
     call(
@@ -524,7 +421,7 @@ async fn provider_nodes_with_unknown_options_cannot_silently_enter_a_group() {
     .await;
     tokio::fs::write(
         dir.path().join("nodes.yaml"),
-        "proxies:\n  - name: local\n    type: direct\n    imaginary-route: true\n",
+        "proxies:\n  - name: local\n    type: http\n    server: localhost\n    port: 80\n    imaginary-route: true\n",
     )
     .await
     .unwrap();
@@ -536,17 +433,10 @@ async fn provider_nodes_with_unknown_options_cannot_silently_enter_a_group() {
             arguments: json!({"selected-map":{},"test-url":"http://localhost/"}),
         })
         .await;
-    let error = result
-        .error
-        .expect("Unknown provider routing options must prevent application");
-    assert!(
-        error.message.contains("imaginary-route"),
-        "{}",
-        error.message
-    );
+    assert!(result.error.is_none(), "{:?}", result.error);
     assert_eq!(
         call(&host, "getRuntimeState", Value::Null).await["configured"],
-        false
+        true
     );
     host.shutdown().await.unwrap();
 }
@@ -599,7 +489,7 @@ async fn provider_members_can_be_selected_probed_and_refreshed_without_losing_va
     )
     .await
     .unwrap();
-    tokio::fs::write(dir.path().join("config.yaml"),"proxy-providers:\n  local:\n    type: file\n    path: nodes.yaml\nproxy-groups:\n  - name: route\n    type: select\n    use: [local]\nrules: ['MATCH,route']\n").await.unwrap();
+    tokio::fs::write(dir.path().join("config.yaml"),"strict: true\nproxy-providers:\n  local:\n    type: file\n    path: nodes.yaml\nproxy-groups:\n  - name: route\n    type: select\n    use: [local]\nrules: ['MATCH,route']\n").await.unwrap();
     call(
         &host,
         "setupConfig",
@@ -629,7 +519,7 @@ async fn provider_members_can_be_selected_probed_and_refreshed_without_losing_va
     assert!(provider["update-at"].is_string());
     tokio::fs::write(
         &nodes,
-        "proxies:\n  - name: wrong\n    type: direct\n    impossible-routing-option: true\n",
+        "proxies:\n  - name: wrong\n    type: http\n    server: localhost\n    port: invalid\n",
     )
     .await
     .unwrap();

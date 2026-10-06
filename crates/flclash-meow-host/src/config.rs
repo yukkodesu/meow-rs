@@ -44,6 +44,15 @@ fn problem(path: impl Into<String>, reason: impl Into<String>) -> Diagnostic {
     }
 }
 
+fn warning(path: impl Into<String>, reason: impl Into<String>) -> Diagnostic {
+    Diagnostic {
+        severity: "warning",
+        path: path.into(),
+        reason: reason.into(),
+        suggestion: "",
+    }
+}
+
 pub fn parse(content: &str, home: Option<&Path>) -> Result<(RawConfig, CheckResult), RpcError> {
     let mut raw = meow_config::parse_raw_yaml(content)
         .map_err(|e| RpcError::new("invalid_config", e.to_string()))?;
@@ -71,68 +80,12 @@ pub fn parse(content: &str, home: Option<&Path>) -> Result<(RawConfig, CheckResu
         }
     }
     let _: RawConfig = serde_ignored::deserialize(document.clone(), |path| {
-        diagnostics.push(problem(path.to_string(), "Unknown configuration field"));
+        diagnostics.push(warning(
+            path.to_string(),
+            "Unknown configuration field ignored by meow-rs",
+        ));
     })
     .map_err(|e| RpcError::new("invalid_config", e.to_string()))?;
-    if let Some(map) = document.as_mapping() {
-        for key in [
-            "firewall",
-            "udp",
-            "udp-timeout",
-            "external-ui-url",
-            "subscriptions",
-        ] {
-            if map
-                .get(Value::String(key.into()))
-                .is_some_and(|v| !v.is_null())
-            {
-                diagnostics.push(problem(
-                    key,
-                    "This field is not supported by the embedded desktop host",
-                ));
-            }
-        }
-        if let Some(tun) = document.get("tun").and_then(Value::as_mapping) {
-            for key in [
-                "stack",
-                "strict-route",
-                "auto-detect-interface",
-                "auto-redirect",
-                "endpoint-independent-nat",
-                "mtu-v6",
-                "route-address",
-                "route-exclude-address",
-                "include-uid",
-                "exclude-uid",
-            ] {
-                if tun
-                    .get(Value::String(key.into()))
-                    .is_some_and(|v| !v.is_null())
-                {
-                    diagnostics.push(problem(
-                        format!("tun.{key}"),
-                        "meow-rs ignores this capture setting",
-                    ));
-                }
-            }
-        }
-        if let Some(geo) = document.get("geodata").and_then(Value::as_mapping) {
-            for key in ["geodata-mode", "geodata-loader", "geoip-matcher"] {
-                if geo
-                    .get(Value::String(key.into()))
-                    .is_some_and(|v| !v.is_null())
-                {
-                    diagnostics.push(Diagnostic {
-                        severity: "warning",
-                        path: format!("geodata.{key}"),
-                        reason: "The meow-rs resource loader ignores this performance setting"
-                            .into(),
-                        suggestion: "Remove this setting; the meow-rs loader is used.",
-                    });
-                }
-            }
-        }
-    }
     for (index, node) in document
         .get("proxies")
         .and_then(Value::as_sequence)
@@ -141,53 +94,6 @@ pub fn parse(content: &str, home: Option<&Path>) -> Result<(RawConfig, CheckResu
         .enumerate()
     {
         check_proxy(node, &format!("proxies[{index}]"), &mut diagnostics);
-    }
-    for (index, listener) in document
-        .get("listeners")
-        .and_then(Value::as_sequence)
-        .into_iter()
-        .flatten()
-        .enumerate()
-    {
-        if let Some(map) = listener.as_mapping() {
-            let path = format!("listeners[{index}]");
-            check_keys(
-                map,
-                "name type listen port max-connections",
-                &path,
-                &mut diagnostics,
-            );
-            if !matches!(
-                listener.get("type").and_then(Value::as_str),
-                Some("mixed" | "http" | "socks5")
-            ) {
-                diagnostics.push(problem(
-                    format!("{path}.type"),
-                    "This desktop host only embeds HTTP, SOCKS5 and mixed listeners",
-                ));
-            }
-        }
-    }
-    if let Some(sniffer) = document.get("sniffer") {
-        if sniffer
-            .get("force-dns-mapping")
-            .is_some_and(|v| !v.is_null())
-        {
-            diagnostics.push(problem(
-                "sniffer.force-dns-mapping",
-                "meow-rs ignores this DNS behavior setting",
-            ));
-        }
-        if let Some(sniff) = sniffer.get("sniff").and_then(Value::as_mapping) {
-            for protocol in sniff.keys() {
-                if !matches!(protocol.as_str(), Some("TLS" | "HTTP")) {
-                    diagnostics.push(problem(
-                        format!("sniffer.sniff.{}", protocol.as_str().unwrap_or("?")),
-                        "Unsupported sniff protocol",
-                    ));
-                }
-            }
-        }
     }
     for (kind, providers) in [
         ("proxy-providers", document.get("proxy-providers")),
@@ -202,14 +108,6 @@ pub fn parse(content: &str, home: Option<&Path>) -> Result<(RawConfig, CheckResu
                     if let Err(error) = contained_path(home, path) {
                         diagnostics.push(problem(format!("{kind}.{name}.path"), error.message));
                     }
-                }
-                if let Some(overrides) = provider.get("override").and_then(Value::as_mapping) {
-                    check_keys(
-                        overrides,
-                        "dialer-proxy",
-                        &format!("{kind}.{name}.override"),
-                        &mut diagnostics,
-                    );
                 }
                 if provider
                     .get("allow-external-plugin")
@@ -246,7 +144,6 @@ pub fn parse(content: &str, home: Option<&Path>) -> Result<(RawConfig, CheckResu
             }
         }
     }
-    raw.strict = Some(true);
     let valid = !diagnostics.iter().any(|d| d.severity == "error");
     Ok((raw, CheckResult { valid, diagnostics }))
 }
@@ -260,9 +157,9 @@ fn check_keys(
     for key in map.keys() {
         let key = key.as_str().unwrap_or("?");
         if !allowed.split_whitespace().any(|a| a == key) {
-            diagnostics.push(problem(
+            diagnostics.push(warning(
                 format!("{path}.{key}"),
-                "Unknown or unsupported option",
+                "Unknown or unsupported option ignored by meow-rs",
             ));
         }
     }
@@ -274,33 +171,26 @@ pub fn validate_provider_node(
     let value = serde_yaml::to_value(node).map_err(|e| e.to_string())?;
     let mut diagnostics = Vec::new();
     check_proxy(&value, "proxy", &mut diagnostics);
-    if diagnostics.is_empty() {
-        Ok(())
-    } else {
+    for diagnostic in diagnostics.iter().filter(|d| d.severity == "warning") {
+        tracing::warn!("{}: {}", diagnostic.path, diagnostic.reason);
+    }
+    if diagnostics.iter().any(|d| d.severity == "error") {
         Err(diagnostics
             .iter()
+            .filter(|d| d.severity == "error")
             .map(|d| format!("{}: {}", d.path, d.reason))
             .collect::<Vec<_>>()
             .join("; "))
+    } else {
+        Ok(())
     }
 }
 
 fn check_proxy(node: &Value, path: &str, diagnostics: &mut Vec<Diagnostic>) {
     let Some(map) = node.as_mapping() else {
-        diagnostics.push(problem(path, "Expected a proxy mapping"));
         return;
     };
     let common = "name type dialer-proxy";
-    if node.get("type").and_then(Value::as_str) == Some("direct")
-        && node.get("name").and_then(Value::as_str) != Some("DIRECT")
-    {
-        diagnostics.push(Diagnostic {
-            severity: "error",
-            path: format!("{path}.name"),
-            reason: "meow-rs direct adapters always expose the name DIRECT; aliases cannot be selected or referenced reliably".into(),
-            suggestion: "Use the built-in DIRECT target instead of a named direct alias.",
-        });
-    }
     let fields = match node.get("type").and_then(Value::as_str).unwrap_or("") {
         "direct" => "dns connect-timeout",
         "ss" => "server port udp password cipher plugin plugin-opts client-fingerprint smux mux",
@@ -312,10 +202,9 @@ fn check_proxy(node: &Value, path: &str, diagnostics: &mut Vec<Diagnostic>) {
         "anytls" => "server port udp password sni skip-cert-verify",
         "hysteria2" => "server port udp password sni skip-cert-verify alpn obfs obfs-password up down ports hop-interval fingerprint",
         "snell" => "server port udp psk version mode obfs-opts reuse",
-        unknown => {diagnostics.push(problem(format!("{path}.type"),format!("Unsupported proxy protocol: {unknown}"))); ""},
+        _ => return,
     };
     check_keys(map, &format!("{common} {fields}"), path, diagnostics);
-    check_option_types(map, path, diagnostics, false);
     for (key, fields) in [
         ("reality-opts", "public-key short-id support-x25519mlkem768"),
         ("ech-opts", "enable config dns"),
@@ -339,19 +228,9 @@ fn check_proxy(node: &Value, path: &str, diagnostics: &mut Vec<Diagnostic>) {
     ] {
         if let Some(value) = node.get(key) {
             let Some(opts) = value.as_mapping() else {
-                diagnostics.push(problem(
-                    format!("{path}.{key}"),
-                    "Expected an options mapping",
-                ));
                 continue;
             };
             check_keys(opts, fields, &format!("{path}.{key}"), diagnostics);
-            check_option_types(
-                opts,
-                &format!("{path}.{key}"),
-                diagnostics,
-                key == "h2-opts",
-            );
             if let Some(brutal) = opts
                 .get(Value::String("brutal-opts".into()))
                 .and_then(Value::as_mapping)
@@ -373,266 +252,34 @@ fn check_proxy(node: &Value, path: &str, diagnostics: &mut Vec<Diagnostic>) {
             ));
         }
         if let Some(opts) = node.get("plugin-opts") {
-            check_plugin_options(plugin, opts, &format!("{path}.plugin-opts"), diagnostics);
+            check_plugin_files(opts, &format!("{path}.plugin-opts"), diagnostics);
         }
-    } else if node.get("plugin-opts").is_some() {
-        diagnostics.push(problem(
-            format!("{path}.plugin-opts"),
-            "Plugin options require a supported plugin",
-        ));
     }
 }
 
-fn check_plugin_options(plugin: &str, opts: &Value, path: &str, diagnostics: &mut Vec<Diagnostic>) {
-    let (text, boolean, integer) = match plugin {
-        "obfs" | "simple-obfs" => ("mode host obfs obfs-host", "", ""),
-        "v2ray-plugin" => ("mode host path header", "tls skip-cert-verify mux", ""),
-        "gost-plugin" => ("mode host path header name-cert-verify fingerprint certificate private-key ech-config ech-opts.config", "tls skip-cert-verify mux ech-enable ech-opts.enable", ""),
-        "shadow-tls" => ("host password alpn name-cert-verify fingerprint certificate private-key", "skip-cert-verify strict-mode", "version"),
-        "restls" => ("host password version-hint restls-script name-cert-verify fingerprint", "skip-cert-verify force-tls12", ""),
-        "jls" => ("host username password alpn", "", ""),
-        "kcptun" => ("key crypt mode", "nocomp acknodelay", "conn autoexpire scavengettl mtu ratelimit sndwnd rcvwnd datashard parityshard dscp nodelay interval resend nc sockbuf smuxver smuxbuf framesize streambuf keepalive"),
-        "ech-tls-tunnel" => ("mode sni path ech_config ech-config fingerprint client-fingerprint client_fingerprint", "", ""),
-        _ => ("", "", ""),
-    };
-    let includes = |fields: &str, key: &str| fields.split_whitespace().any(|field| field == key);
-    let check = |key: &str, value: &Value, field: String, diagnostics: &mut Vec<Diagnostic>| {
-        let key = if matches!(plugin, "obfs" | "simple-obfs") {
-            key.to_string()
-        } else {
-            key.trim().to_ascii_lowercase()
-        };
-        let scalar = match value {
-            Value::String(s) => Some(s.trim().to_string()),
-            Value::Bool(v) => Some(v.to_string()),
-            Value::Number(v) => Some(v.to_string()),
-            _ => None,
-        };
-        let valid = if includes(boolean, &key) {
-            scalar.as_deref().is_some_and(|s| {
-                matches!(
-                    s.to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on" | "0" | "false" | "no" | "off"
-                ) || (s.is_empty()
-                    && (plugin == "v2ray-plugin" || (plugin == "kcptun" && key == "acknodelay")))
-            })
-        } else if includes(integer, &key) {
-            scalar.as_deref().is_some_and(|s| s.parse::<u64>().is_ok())
-        } else if includes(text, &key) {
-            value.as_str().is_some_and(|s| {
-                !s.contains(';')
-                    && (key != "header"
-                        || s.split_once(':')
-                            .is_some_and(|(name, _)| !name.trim().is_empty()))
-            })
-        } else {
-            diagnostics.push(problem(field, "Unknown or unsupported plugin option"));
-            return;
-        };
-        if matches!(key.as_str(), "certificate" | "private-key")
-            && !value.as_str().is_some_and(|s| s.contains("-----BEGIN"))
-        {
-            diagnostics.push(problem(field, "File-backed plugin certificates and keys are unsupported in the host; use inline PEM to avoid unconfined file reads"));
-            return;
-        }
-        let recognized = if plugin == "kcptun" && key == "crypt" {
-            scalar.as_deref().is_some_and(|s| {
-                matches!(
-                    s.to_ascii_lowercase().as_str(),
-                    "aes"
-                        | "aes-256"
-                        | "aes-128"
-                        | "aes-192"
-                        | "aes-128-gcm"
-                        | "salsa20"
-                        | "none"
-                        | "null"
-                        | "xor"
-                        | "tea"
-                        | "xtea"
-                        | "blowfish"
-                        | "twofish"
-                        | "cast5"
-                        | "3des"
-                        | "sm4"
-                )
-            })
-        } else if plugin == "kcptun" && key == "mode" {
-            scalar.as_deref().is_some_and(|s| {
-                matches!(
-                    s.to_ascii_lowercase().as_str(),
-                    "normal" | "fast" | "fast2" | "fast3" | "manual"
-                )
-            })
-        } else {
-            true
-        };
-        if !valid || !recognized {
-            diagnostics.push(problem(field, "Invalid plugin option value; coercion, flattening or discarded values are not allowed"));
+fn check_plugin_files(opts: &Value, path: &str, diagnostics: &mut Vec<Diagnostic>) {
+    let check = |key: &str, value: &str, diagnostics: &mut Vec<Diagnostic>| {
+        let key = key.trim().to_ascii_lowercase();
+        if matches!(key.as_str(), "certificate" | "private-key") && !value.contains("-----BEGIN") {
+            diagnostics.push(problem(format!("{path}.{key}"), "File-backed plugin certificates and keys are unsupported in the host; use inline PEM to avoid unconfined file reads"));
         }
     };
     match opts {
         Value::String(opts) => {
-            for token in opts
-                .split(';')
-                .map(str::trim)
-                .filter(|token| !token.is_empty())
-            {
-                let (key, value) = token.split_once('=').unwrap_or((token, "true"));
-                check(
-                    key,
-                    &Value::String(value.trim().to_string()),
-                    format!("{path}.{}", key.trim()),
-                    diagnostics,
-                );
+            for token in opts.split(';') {
+                if let Some((key, value)) = token.split_once('=') {
+                    check(key, value, diagnostics);
+                }
             }
         }
         Value::Mapping(opts) => {
             for (key, value) in opts {
-                let Some(name) = key.as_str().filter(|s| !s.contains([';', '='])) else {
-                    diagnostics.push(problem(
-                        format!("{path}.?"),
-                        "Expected a plugin option name without separators",
-                    ));
-                    continue;
-                };
-                let field = format!("{path}.{name}");
-                if name.eq_ignore_ascii_case("headers")
-                    && matches!(plugin, "v2ray-plugin" | "gost-plugin")
-                {
-                    if let Some(headers) = value.as_mapping() {
-                        for (name, value) in headers {
-                            if !name.as_str().is_some_and(|s| {
-                                !s.trim().is_empty() && !s.contains([';', '=', ':'])
-                            }) || !value.as_str().is_some_and(|s| !s.contains(';'))
-                            {
-                                diagnostics.push(problem(format!("{field}.{}", name.as_str().unwrap_or("?")), "Expected a string header name and value without SIP003 separators"));
-                            }
-                        }
-                    } else {
-                        diagnostics.push(problem(field, "Expected a headers mapping"));
-                    }
-                } else if name.eq_ignore_ascii_case("alpn")
-                    && includes(text, "alpn")
-                    && value.is_sequence()
-                {
-                    if !value
-                        .as_sequence()
-                        .unwrap()
-                        .iter()
-                        .all(|v| v.as_str().is_some_and(|s| !s.contains([',', ';'])))
-                    {
-                        diagnostics
-                            .push(problem(field, "Expected ALPN strings without separators"));
-                    }
-                } else if name == "ech-opts" && plugin == "gost-plugin" && value.is_mapping() {
-                    for (key, value) in value.as_mapping().unwrap() {
-                        let key = key.as_str().unwrap_or("?");
-                        check(
-                            &format!("ech-opts.{key}"),
-                            value,
-                            format!("{field}.{key}"),
-                            diagnostics,
-                        );
-                    }
-                } else {
-                    check(name, value, field, diagnostics);
+                if let (Some(key), Some(value)) = (key.as_str(), value.as_str()) {
+                    check(key, value, diagnostics);
                 }
             }
         }
-        _ => diagnostics.push(problem(
-            path,
-            "Expected a plugin options mapping or SIP003 string",
-        )),
-    }
-}
-
-fn check_option_types(
-    map: &serde_yaml::Mapping,
-    path: &str,
-    diagnostics: &mut Vec<Diagnostic>,
-    h2_hosts: bool,
-) {
-    for (key, value) in map {
-        let Some(key) = key.as_str() else { continue };
-        let strings = |v: &Value| {
-            v.as_sequence()
-                .is_some_and(|seq| seq.iter().all(Value::is_string))
-        };
-        let valid = match key {
-            "udp"
-            | "tls"
-            | "skip-cert-verify"
-            | "enabled"
-            | "enable"
-            | "padding"
-            | "only-tcp"
-            | "support-x25519mlkem768"
-            | "no-grpc-header"
-            | "reuse" => value.is_bool(),
-            "host" if h2_hosts => strings(value),
-            "name"
-            | "type"
-            | "server"
-            | "username"
-            | "password"
-            | "cipher"
-            | "psk"
-            | "uuid"
-            | "sni"
-            | "servername"
-            | "dialer-proxy"
-            | "plugin"
-            | "client-fingerprint"
-            | "flow"
-            | "encryption"
-            | "network"
-            | "public-key"
-            | "short-id"
-            | "config"
-            | "path"
-            | "mode"
-            | "protocol"
-            | "grpc-service-name"
-            | "early-data-header-name"
-            | "obfs"
-            | "obfs-password"
-            | "fingerprint"
-            | "host" => value.is_string(),
-            "port" | "alterId" | "connect-timeout" | "max-connections" | "min-streams"
-            | "max-streams" | "max-early-data" => value.as_u64().is_some(),
-            "alpn" => {
-                strings(value)
-                    || (path.ends_with("plugin-opts") && value.is_string())
-                    || (map
-                        .get(Value::String("type".into()))
-                        .and_then(Value::as_str)
-                        == Some("hysteria2")
-                        && value.is_string())
-            }
-            "headers" => {
-                if let Some(headers) = value.as_mapping() {
-                    for (name, header) in headers {
-                        if !name.is_string() || !header.is_string() {
-                            diagnostics.push(problem(
-                                format!("{path}.headers.{}", name.as_str().unwrap_or("?")),
-                                "Expected a string header name and value",
-                            ));
-                        }
-                    }
-                    true
-                } else {
-                    false
-                }
-            }
-            _ => true,
-        };
-        if !valid {
-            diagnostics.push(problem(
-                format!("{path}.{key}"),
-                "Invalid value type for this supported option",
-            ));
-        }
+        _ => {}
     }
 }
 
