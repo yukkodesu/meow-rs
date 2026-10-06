@@ -13,6 +13,66 @@ async fn call(host: &Host, method: &str, arguments: Value) -> Response {
 }
 
 #[tokio::test]
+async fn tun_settings_preserve_listener_endpoints_and_traffic_history() {
+    let host = Host::new();
+    let home = tempfile::tempdir().unwrap();
+    host.state.lock().await.home = Some(home.path().to_path_buf());
+    tokio::fs::write(home.path().join("config.yaml"), "listeners: [{name: local, type: mixed, listen: 127.0.0.1, port: 0}]\nrules: ['MATCH,DIRECT']\n").await.unwrap();
+    assert!(call(&host, "setupConfig", Value::Null)
+        .await
+        .error
+        .is_none());
+    assert_eq!(call(&host, "startListener", Value::Null).await.result, true);
+    let before = call(&host, "getRuntimeState", Value::Null).await.result;
+    {
+        let state = host.state.lock().await;
+        let statistics = state.runtime.as_ref().unwrap().state.tunnel.statistics();
+        statistics.add_upload(128);
+        statistics.add_download(256);
+    }
+    let traffic = call(&host, "getTotalTraffic", json!(false)).await.result;
+    let changed = call(
+        &host,
+        "updateConfig",
+        json!({"tun":{"enable":false,"mtu":1400}}),
+    )
+    .await;
+    assert!(changed.error.is_none(), "{:?}", changed.error);
+    assert_eq!(
+        call(&host, "getTotalTraffic", json!(false)).await.result,
+        traffic
+    );
+    assert_eq!(
+        call(&host, "getRuntimeState", Value::Null).await.result["listeners"],
+        before["listeners"]
+    );
+    let document = host.state.lock().await.document.clone();
+    let mode = host
+        .state
+        .lock()
+        .await
+        .runtime
+        .as_ref()
+        .unwrap()
+        .state
+        .raw_config
+        .read()
+        .mode
+        .clone();
+    for patch in [
+        json!({"mode":"invalid","tun":{"enable":false,"mtu":1450}}),
+        json!({"mode":"global","tun":{"enable":"invalid"}}),
+    ] {
+        assert!(call(&host, "updateConfig", patch).await.error.is_some());
+        let state = host.state.lock().await;
+        assert_eq!(state.document, document);
+        let runtime = state.runtime.as_ref().unwrap();
+        assert_eq!(runtime.state.raw_config.read().mode, mode);
+    }
+    assert!(call(&host, "shutdown", Value::Null).await.error.is_none());
+}
+
+#[tokio::test]
 async fn failed_crash_recovery_blocks_configuration_and_listener_start() {
     use meow_listener::tun::{RecoveryState, RecoveryStatus};
 

@@ -273,10 +273,6 @@ impl Host {
                 Ok(json!(""))
             }
             "updateConfig" => {
-                let runtime = state
-                    .runtime
-                    .as_ref()
-                    .ok_or_else(|| RpcError::new("not_configured", "No profile is configured"))?;
                 let mut document = state.document.clone().ok_or_else(|| {
                     RpcError::new("not_configured", "No applied configuration document")
                 })?;
@@ -285,12 +281,65 @@ impl Host {
                 })?;
                 if updates
                     .keys()
-                    .all(|k| matches!(k.as_str(), "mode" | "log-level"))
+                    .all(|k| matches!(k.as_str(), "mode" | "log-level" | "tun"))
                 {
+                    let runtime = state.runtime.as_mut().ok_or_else(|| {
+                        RpcError::new("not_configured", "No profile is configured")
+                    })?;
                     let router = runtime.router.clone();
-                    Runtime::request(router, "PATCH", "/configs".into(), arguments.clone()).await?;
+                    let intent = self.generation.subscribe();
+                    let general = updates
+                        .iter()
+                        .filter(|(key, _)| key.as_str() != "tun")
+                        .map(|(key, value)| (key.clone(), value.clone()))
+                        .collect::<serde_json::Map<_, _>>();
+                    let previous = {
+                        let raw = runtime.state.raw_config.read();
+                        (raw.mode.clone(), raw.log_level.clone())
+                    };
+                    let has_general = !general.is_empty();
+                    if has_general {
+                        Runtime::request(
+                            router.clone(),
+                            "PATCH",
+                            "/configs".into(),
+                            Value::Object(general),
+                        )
+                        .await?;
+                    }
+                    if let Some(tun) = updates.get("tun") {
+                        if let Err(error) = runtime.update_tun(tun, intent).await {
+                            if has_general {
+                                let rollback = json!({
+                                    "mode":previous.0.as_deref().unwrap_or("rule"),
+                                    "log-level":previous.1.as_deref().unwrap_or("info"),
+                                });
+                                Runtime::request(router, "PATCH", "/configs".into(), rollback)
+                                    .await
+                                    .map_err(|rollback| {
+                                        RpcError::new(
+                                            "config_rollback_failed",
+                                            format!("{error:?}; settings rollback: {rollback:?}"),
+                                        )
+                                    })?;
+                                let mut raw = runtime.state.raw_config.write();
+                                raw.mode = previous.0;
+                                raw.log_level = previous.1;
+                            }
+                            return Err(error);
+                        }
+                    }
                     if let Some(document) = state.document.as_mut() {
                         for (key, value) in updates {
+                            if key == "tun" && document[key].is_object() {
+                                document[key]
+                                    .as_object_mut()
+                                    .expect("TUN document object")
+                                    .extend(
+                                        value.as_object().expect("validated TUN fields").clone(),
+                                    );
+                                continue;
+                            }
                             document[key] = value.clone();
                         }
                     }

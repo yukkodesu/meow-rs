@@ -21,6 +21,9 @@ use tower::ServiceExt;
 #[path = "background.rs"]
 mod background;
 
+#[path = "tun.rs"]
+mod tun;
+
 pub struct Runtime {
     pub state: Arc<AppState>,
     pub router: Router,
@@ -192,58 +195,7 @@ impl Runtime {
                 ),
             ));
         }
-        if self.config.tun.enable {
-            let binding = self
-                .binding
-                .take()
-                .unwrap_or_else(|| meow_api::preinstall_global_route_binding(&self.config.raw));
-            let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-            let recovery_directory = crate::native::recovery_directory().map_err(|error| {
-                RpcError::new("tun_failed", format!("TUN recovery directory: {error}"))
-            })?;
-            let mut listener = meow_listener::TunListener::new(
-                self.state.tunnel.clone(),
-                meow_api::tun_config_to_listener_config(&self.config.tun),
-                "FlClashMeowTun".into(),
-            )
-            .with_readiness_signal(ready_tx)
-            .with_recovery_directory(recovery_directory);
-            if let Some(binding) = binding.into_binding() {
-                listener = listener.with_outbound_binding(binding);
-            }
-            let failure = Arc::clone(&self.failure);
-            self.pending_tun = Some(tokio::spawn(async move {
-                if let Err(e) = listener.run().await {
-                    *failure.write() = Some(format!("TUN failed: {e}"));
-                    tracing::error!("TUN failed: {e}");
-                }
-            }));
-            match tokio::time::timeout(meow_api::TUN_STARTUP_TIMEOUT, ready_rx).await {
-                Ok(Ok(meow_listener::TunReady::Ready {
-                    core_done,
-                    udp_flows,
-                })) => {
-                    self.state
-                        .tunnel
-                        .set_tun_handle(meow_tunnel::TunHandle {
-                            task: self.pending_tun.take().expect("owned pending TUN task"),
-                            core_done: Some(core_done),
-                            udp_flows,
-                        })
-                        .await
-                        .map_err(|error| {
-                            RpcError::new("resources_release_unconfirmed", error.to_string())
-                        })?;
-                }
-                result => {
-                    let reason = match result {
-                        Ok(Ok(meow_listener::TunReady::Failed(reason))) => reason,
-                        _ => "TUN readiness failed or timed out".into(),
-                    };
-                    return Err(RpcError::new("tun_failed", reason));
-                }
-            }
-        }
+        self.start_tun().await?;
         let sniffer = Arc::new(SnifferRuntime::new(self.config.sniffer.clone()));
         for (listener, socket) in bound {
             let tunnel = self.state.tunnel.clone();
@@ -332,24 +284,7 @@ impl Runtime {
             let _ = task.await;
             self.retired_dns.pop();
         }
-        if let Some(task) = self.pending_tun.as_mut() {
-            task.abort();
-            if let Err(error) = task.await {
-                if !error.is_cancelled() {
-                    self.state
-                        .tunnel
-                        .report_tun_cleanup_failure(error.to_string());
-                }
-            }
-        }
-        self.pending_tun = None;
-        let mut cleanup = self.state.tunnel.stop_tun().await;
-        if let Err(error) = meow_listener::tun::await_tun_core_teardown().await {
-            self.state
-                .tunnel
-                .report_tun_cleanup_failure(error.to_string());
-            cleanup = Err(error);
-        }
+        let cleanup = self.stop_tun().await;
         self.state.tunnel.statistics().close_all_connections();
         self.state.tunnel.close_all_udp_sessions();
         self.state.tunnel.reconcile_health_checks(&[]);

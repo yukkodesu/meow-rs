@@ -228,6 +228,35 @@ async fn exercise(
     let running = session.start().await?;
     anyhow::ensure!(running["running"] == true, "{running}");
     evidence.push(json!({"phase":"nativeTraffic","results":fixtures.verify().await?}));
+    let traffic = session.call("getTotalTraffic", json!(false)).await?;
+    for enable in [false, true] {
+        session
+            .call("updateConfig", json!({"tun":{"enable":enable}}))
+            .await?;
+        let changed = session.call("getRuntimeState", Value::Null).await?;
+        anyhow::ensure!(
+            changed["running"] == true && changed["tunActive"] == enable,
+            "TUN toggle did not preserve proxy readiness: {changed}"
+        );
+        anyhow::ensure!(
+            changed["listeners"] == running["listeners"],
+            "TUN toggle replaced proxy listeners"
+        );
+        let totals = session.call("getTotalTraffic", json!(false)).await?;
+        for direction in ["up", "down"] {
+            anyhow::ensure!(
+                totals[direction].as_i64() >= traffic[direction].as_i64(),
+                "TUN toggle reset traffic history"
+            );
+        }
+        if !enable {
+            anyhow::ensure!(
+                snapshot()? == before,
+                "TUN toggle did not restore DNS/routes"
+            );
+        }
+    }
+    evidence.push(json!({"phase":"tunToggle","results":fixtures.verify().await?}));
     let directory = flclash_meow_host::native::recovery_directory()?;
     let journal = |name: &str| -> anyhow::Result<Value> {
         Ok(serde_json::from_slice(&std::fs::read(

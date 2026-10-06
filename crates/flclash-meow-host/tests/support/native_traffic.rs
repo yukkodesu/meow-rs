@@ -108,7 +108,9 @@ impl Fixtures {
             anyhow::ensure!(&reply == b"meow", "TCP origin reply mismatch");
             Ok(())
         };
-        tokio::time::timeout(Duration::from_secs(10), tcp((ip, self.tcp.port()).into())).await??;
+        tokio::time::timeout(Duration::from_secs(10), tcp((ip, self.tcp.port()).into()))
+            .await
+            .context("TUN fake-IP TCP echo deadline")??;
         let udp = async |address: std::net::SocketAddr| -> anyhow::Result<()> {
             let peer = UdpSocket::bind("0.0.0.0:0").await?;
             peer.send_to(b"meow", address).await?;
@@ -120,7 +122,9 @@ impl Fixtures {
             );
             Ok(())
         };
-        tokio::time::timeout(Duration::from_secs(10), udp((ip, self.udp.port()).into())).await??;
+        tokio::time::timeout(Duration::from_secs(10), udp((ip, self.udp.port()).into()))
+            .await
+            .context("TUN fake-IP UDP echo deadline")??;
         tokio::time::timeout(Duration::from_secs(5), tcp(self.tcp)).await??;
         tokio::time::timeout(Duration::from_secs(5), udp(self.udp)).await??;
         let ipv6 = self.dns_query(28).await?;
