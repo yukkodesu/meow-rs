@@ -190,6 +190,16 @@ impl Host {
             Self::complete_recovery(&mut state).await;
         }
         if matches!(method, "setupConfig" | "updateConfig" | "startListener") {
+            if matches!(
+                state.recovery.state,
+                meow_listener::tun::RecoveryState::Failed
+                    | meow_listener::tun::RecoveryState::NeedsPrivilege
+            ) {
+                return Err(RpcError::new(
+                    "resources_release_unconfirmed",
+                    state.recovery.details.join("; "),
+                ));
+            }
             if let Some(failure) = state.cleanup_failure.as_ref() {
                 return Err(RpcError::new("resources_release_unconfirmed", failure));
             }

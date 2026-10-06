@@ -13,17 +13,33 @@ async fn call(host: &Host, method: &str, arguments: Value) -> Response {
 }
 
 #[tokio::test]
+async fn failed_crash_recovery_blocks_configuration_and_listener_start() {
+    use meow_listener::tun::{RecoveryState, RecoveryStatus};
+
+    let host = Host::new();
+    for recovery in [RecoveryState::Failed, RecoveryState::NeedsPrivilege] {
+        host.state.lock().await.recovery = RecoveryStatus {
+            state: recovery,
+            details: vec!["Recorded DNS state could not be restored".into()],
+        };
+        for method in ["setupConfig", "updateConfig", "startListener"] {
+            assert_eq!(
+                call(&host, method, Value::Null).await.error.unwrap().code,
+                "resources_release_unconfirmed"
+            );
+        }
+        assert_eq!(
+            call(&host, "getRuntimeState", Value::Null).await.result["running"],
+            false
+        );
+    }
+}
+
+#[tokio::test]
 async fn cleanup_failure_retains_the_session_and_prevents_runtime_replacement() {
     let host = Arc::new(Host::new());
     let home = tempfile::tempdir().unwrap();
-    assert!(call(
-        &host,
-        "initClash",
-        json!({"home-dir":home.path(),"version":1})
-    )
-    .await
-    .error
-    .is_none());
+    host.state.lock().await.home = Some(home.path().to_path_buf());
     for file in ["Country.mmdb", "GeoLite2-ASN.mmdb", "geosite.dat"] {
         tokio::fs::write(home.path().join(file), []).await.unwrap();
     }
@@ -118,14 +134,7 @@ async fn cleanup_failure_retains_the_session_and_prevents_runtime_replacement() 
 async fn a_later_stop_cancels_startup_and_waits_for_core_release() {
     let host = Arc::new(Host::new());
     let home = tempfile::tempdir().unwrap();
-    assert!(call(
-        &host,
-        "initClash",
-        json!({"home-dir":home.path(),"version":1})
-    )
-    .await
-    .error
-    .is_none());
+    host.state.lock().await.home = Some(home.path().to_path_buf());
     for file in ["Country.mmdb", "GeoLite2-ASN.mmdb", "geosite.dat"] {
         tokio::fs::write(home.path().join(file), []).await.unwrap();
     }

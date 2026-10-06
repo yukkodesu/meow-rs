@@ -105,12 +105,7 @@ mod native {
 
     pub(super) fn read(resource: &str) -> io::Result<Option<String>> {
         let (guid, family) = decode(resource)?;
-        let service = if family == "IPv4" { "Tcpip" } else { "Tcpip6" };
-        let output = run(&format!(
-            r#"$guid = '{guid}'; {adapter_lookup}; $key = Get-Item 'HKLM:\SYSTEM\CurrentControlSet\Services\{service}\Parameters\Interfaces\{{{guid}}}'; $value = $key.GetValue('NameServer', ''); $servers = @($value -split '[,;\s]+' | Where-Object {{ $_ }}); ConvertTo-Json -InputObject $servers -Compress"#,
-            adapter_lookup = include_str!("windows_dns_adapter.ps1"),
-        ))?;
-        let addresses: Vec<IpAddr> = serde_json::from_str(&output).map_err(io::Error::other)?;
+        let addresses = windows::read(guid, family)?;
         serde_json::to_string(&addresses)
             .map(Some)
             .map_err(io::Error::other)
@@ -124,6 +119,9 @@ mod native {
             .any(|address| address.is_ipv4() != (family == "IPv4"))
         {
             return Err(io::Error::other("DNS backup address family mismatch"));
+        }
+        if windows::write(guid, family, &addresses)? {
+            return Ok(());
         }
         let action = if addresses.is_empty() {
             "-ResetServerAddresses".into()
@@ -143,7 +141,33 @@ mod native {
         ))?;
         Ok(())
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn native_snapshots_match_the_previous_windows_backend() {
+            let resources = plan("127.0.0.1".parse().unwrap(), u32::MAX).unwrap();
+            for (resource, _) in resources.into_iter().take(3) {
+                let (guid, family) = decode(&resource).unwrap();
+                let service = if family == "IPv4" { "Tcpip" } else { "Tcpip6" };
+                let previous = run(&format!(
+                    r#"$guid = '{guid}'; {adapter_lookup}; $key = Get-Item 'HKLM:\SYSTEM\CurrentControlSet\Services\{service}\Parameters\Interfaces\{{{guid}}}'; $value = $key.GetValue('NameServer', ''); $servers = @($value -split '[,;\s]+' | Where-Object {{ $_ }}); ConvertTo-Json -InputObject $servers -Compress"#,
+                    adapter_lookup = include_str!("windows_dns_adapter.ps1"),
+                )).unwrap();
+                let addresses: Vec<IpAddr> = serde_json::from_str(&previous).unwrap();
+                assert!(
+                    read(&resource).unwrap().unwrap() == serde_json::to_string(&addresses).unwrap()
+                );
+            }
+        }
+    }
 }
+
+#[cfg(target_os = "windows")]
+#[path = "windows_dns.rs"]
+mod windows;
 
 #[cfg(target_os = "macos")]
 mod native {
