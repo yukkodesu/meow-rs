@@ -1,4 +1,5 @@
 use flclash_meow_host::{serve_until, Host};
+use std::io::IsTerminal;
 use std::sync::Arc;
 use tracing_subscriber::prelude::*;
 
@@ -31,7 +32,14 @@ async fn main() -> anyhow::Result<()> {
         .with(meow_api::log_stream::LogBroadcastLayer {
             tx: host.log_sender(),
         })
-        .with(tracing_subscriber::fmt::layer().with_writer(std::io::stderr))
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(std::io::stderr)
+                .with_filter(tracing_subscriber::filter::filter_fn(|_| {
+                    std::io::stderr().is_terminal()
+                })),
+        )
         .init();
     meow_api::log_stream::install_log_reloader(move |level| {
         let level = match level {
