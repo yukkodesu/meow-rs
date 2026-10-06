@@ -4,6 +4,8 @@ use serde::Serialize;
 use serde_yaml::Value;
 use std::path::{Path, PathBuf};
 
+mod compat;
+
 #[derive(Debug, Serialize)]
 pub struct Diagnostic {
     pub severity: &'static str,
@@ -62,6 +64,7 @@ pub fn parse(content: &str, home: Option<&Path>) -> Result<(RawConfig, CheckResu
         .apply_merge()
         .map_err(|e| RpcError::new("invalid_config", e.to_string()))?;
     let mut diagnostics = Vec::new();
+    compat::apply(&mut raw, &mut diagnostics);
     if raw
         .authentication
         .as_ref()
