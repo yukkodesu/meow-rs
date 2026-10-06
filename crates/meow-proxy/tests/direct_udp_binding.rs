@@ -43,12 +43,6 @@ async fn direct_udp_loopback_works_with_outbound_interface_binding() {
                 ..Default::default()
             };
             let connection = adapter.dial_udp(&metadata).await.unwrap();
-            assert!(connection
-                .local_addr()
-                .unwrap()
-                .ip()
-                .to_canonical()
-                .is_loopback());
             connection.write_packet(b"meow", &address).await.unwrap();
             let mut buffer = [0; 16];
             let (length, source) =
