@@ -69,6 +69,13 @@ async-trait = { workspace = true }
 tracing-subscriber = { workspace = true }
 smol_str = { workspace = true }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.60", features = [
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+
 [[test]]
 name = "ss_listener_integration"
 required-features = ["listener-shadowsocks"]

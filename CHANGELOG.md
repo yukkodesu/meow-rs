@@ -8,6 +8,12 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Windows TUN readiness**: configure owned Wintun addresses as Preferred
+  before installing routes or starting packet handling, avoiding the
+  tentative-address window during startup and configuration reload.
+
 ### Added
 
 - **OpenWrt x86_64 packages** (issue #725): releases and alpha prereleases
