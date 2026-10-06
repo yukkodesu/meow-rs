@@ -202,7 +202,7 @@ fn check_proxy(node: &Value, path: &str, diagnostics: &mut Vec<Diagnostic>) {
         "vmess" => "server port udp uuid alterId cipher tls servername skip-cert-verify client-fingerprint network ws-opts grpc-opts h2-opts http-upgrade-opts smux mux alpn",
         "http" => "server port username password tls skip-cert-verify headers",
         "socks5" => "server port udp username password tls skip-cert-verify",
-        "anytls" => "server port udp password sni skip-cert-verify",
+        "anytls" => "server port udp password sni skip-cert-verify fingerprint name-cert-verify client-fingerprint alpn",
         "hysteria2" => "server port udp password sni skip-cert-verify alpn obfs obfs-password up down ports hop-interval fingerprint",
         "snell" => "server port udp psk version mode obfs-opts reuse",
         _ => return,
